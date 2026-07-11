@@ -74,6 +74,63 @@ static inline float compute_block_dot_product_q8_0(const block_q8_0* a_block, co
     return final_sum * scale;
 }
 
+// Same as compute_block_dot_product_q8_0, but skips the per-call vector-mask
+// save/set/restore. The mask CSR is hardware-persistent state untouched by
+// compiler-generated code between explicit asm blocks (unlike an ordinary
+// vector register the allocator could reuse) -- so a caller that invokes
+// this in a tight loop (e.g. across all K_blocks of one row) can set the
+// mask to 0xFF ONCE before the loop and restore it ONCE after, instead of
+// paying the save/set/restore CSR sequence on every 32-element block. The
+// externally observable mask state is identical either way: whatever it
+// was before the caller's own save+set, 0xFF for the loop's duration,
+// restored after -- this only removes (K_blocks-1) redundant CSR
+// read-modify-write pairs per row, it does not change any computed value.
+// Caller is responsible for the surrounding mask save/set(0xFF)/restore.
+static inline float compute_block_dot_product_q8_0_masked(const block_q8_0* a_block, const float* b_col_start) {
+    __asm__ volatile("fbci.pi f10, 0" ::: "f10");       // Use f10 as accumulator, init to 0
+
+    static const int32_t gather_pattern[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+
+    __asm__ volatile("flw.ps f31, %[gather]\n" : : [gather] "m"(*(const int32_t(*)[8])gather_pattern) : "f31");
+
+    // Process 32 elements in 4 chunks of 8 elements each
+    for (int chunk = 0; chunk < 4; chunk++) {
+        int offset = chunk << 3; // chunk * 8
+
+        __asm__ volatile(
+            "flw.ps f12, %[b_vec]\n"                 // Load 8 B values (floats)
+            "fgb.ps f11, f31(%[a_ptr])\n"            // Gather 8 int8 bytes from A using pattern
+            "fcvt.ps.pw f11, f11\n"                  // Convert int8 vector to float vector
+            "fmadd.ps f10, f11, f12, f10\n"          // acc += a_vec * b_vec (8-wide)
+            :
+            : [a_ptr] "r"(&a_block->qs[offset]),
+              [b_vec] "m"(*(const float(*)[8])&b_col_start[offset]),
+              [scale] "m"(a_block->d)
+            : "f10", "f11", "f12"
+        );
+    }
+
+    // Horizontal sum: reduce f10 into a single scalar
+    float final_sum;
+    __asm__ __volatile__ (
+        // Pairwise sum within each 128-bit half
+        "fswizz.ps f1, f10, 0xB1 \n\t"             // Swaps: e0<->e1 and e2<->e3
+        "fadd.ps   f2, f10, f1, rne \n\t"
+        // Complete the sum for each 128-bit half
+        "fswizz.ps f3, f2, 0x4E \n\t"              // Swaps: e0,e1 <-> e2,e3
+        "fadd.ps   f4, f2, f3, rne \n\t"
+        // Sum across the two 128b halfs
+        "fmvz.x.ps t0, f4, 4 \n\t"
+        "fbcx.ps   f5, t0 \n\t"
+        "fadd.ps   %[vout], f4, f5, rne \n\t"
+        : [vout] "=f" (final_sum)
+        :: "t0", "f10", "f2", "f3", "f4", "f5"
+    );
+
+    const float scale = fp16_to_fp32(a_block->d);
+    return final_sum * scale;
+}
+
 
 // Compute dot product between f16 block and f32 column vector (NAIVE VERSION)
 // Scalar implementation for debugging - no vectorization
