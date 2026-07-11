@@ -428,6 +428,11 @@ int entry_point(struct ggml_et_rope_params* params, void* env) {
 
     int32_t last_pos = -1;
 
+    uint64_t rope_neox_saved_mask = 0;
+    if (is_neox) {
+        rope_neox_saved_mask = rope_ps_enter_fullmask();
+    }
+
     for (int64_t wu = start_wu; wu < end_wu; ++wu) {
         const int64_t h = wu % heads;
         const int64_t s = (wu / heads) % seq_len;
@@ -457,10 +462,6 @@ int entry_point(struct ggml_et_rope_params* params, void* env) {
         }
 
         if (is_neox) {
-            uint64_t temp_mask;
-            __asm__ volatile("mova.x.m %0" : "=r"(temp_mask));
-            __asm__ volatile("mov.m.x m0, x0, 0xFF");
-
             for (int32_t dim_idx = 0; dim_idx < half_dims; dim_idx += 8) {
                 __asm__ volatile(
                     "flw.ps f0, %[x0_src]       \n\t"
@@ -482,8 +483,6 @@ int entry_point(struct ggml_et_rope_params* params, void* env) {
                     : "f0", "f1", "f2", "f3", "f4", "f5", "memory"
                 );
             }
-
-            __asm__ volatile("mova.m.x %0" :: "r"(temp_mask));
         } else {
             for (int32_t pair_idx = 0; pair_idx < half_dims; ++pair_idx) {
                 const int32_t dim_in_head = pair_idx * 2;
@@ -494,6 +493,10 @@ int entry_point(struct ggml_et_rope_params* params, void* env) {
                 head_dst[dim_in_head + 1] = x0 * sin_cache[pair_idx] + x1 * cos_cache[pair_idx];
             }
         }
+    }
+
+    if (is_neox) {
+        rope_ps_leave_fullmask(rope_neox_saved_mask);
     }
 
     return 0;
