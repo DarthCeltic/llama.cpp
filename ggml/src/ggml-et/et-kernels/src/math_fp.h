@@ -31,6 +31,23 @@ static inline float et_fdiv(float a, float b) {
     return d;
 }
 
+// Same as et_fdiv but skips the per-call mask save/set/restore -- for a
+// caller that has ALREADY set the mask to single-lane (mov.m.x m0,x0,1)
+// around a group of consecutive et_fdiv_masked/et_powf_masked calls with
+// no other mask-touching code in between. Caller is responsible for the
+// surrounding save/set/restore and MUST restore before any subsequent
+// 8-wide vector op that expects the ambient (usually 0xFF) mask.
+static inline float et_fdiv_masked(float a, float b) {
+    float d;
+    __asm__ volatile (
+        "frcp.ps   %[d], %[b]           \n\t"
+        "fmul.s    %[d], %[d], %[a]     \n\t"
+        : [d] "=&f"(d)
+        : [a] "f"(a), [b] "f"(b)
+    );
+    return d;
+}
+
 // Power function using ET hardware vector instructions
 // Implements pow(base, exp) = exp(exp * ln(base)) using FLOG.PS and FEXP.PS
 static inline float et_powf(float base, float exp) {
@@ -66,6 +83,35 @@ static inline float et_powf(float base, float exp) {
         : [base] "f"(base), [exp] "f"(exp)
     );
 
+    return result;
+}
+
+// Same as et_powf but skips the per-call mask save/set/restore -- see
+// et_fdiv_masked. Caller is responsible for the surrounding save/set(1)/
+// restore. The special-case early returns below don't touch the mask
+// register either way, so they behave identically to et_powf.
+static inline float et_powf_masked(float base, float exp) {
+    if (base <= 0.0f) {
+        if (base == 0.0f) {
+            if (exp > 0.0f) return 0.0f;
+            union { float f; uint32_t i; } inf = { .i = 0x7F800000 };
+            return inf.f;
+        }
+        union { float f; uint32_t i; } nan = { .i = 0x7FC00000 };
+        return nan.f;
+    }
+    if (base == 1.0f) return 1.0f;
+    if (exp == 0.0f) return 1.0f;
+    if (exp == 1.0f) return base;
+
+    float result;
+    __asm__ volatile (
+        "flog.ps %[result], %[base]     \n\t"
+        "fmul.s %[result], %[result], %[exp]\n\t"
+        "fexp.ps %[result], %[result]   \n\t"
+        : [result] "=&f"(result)
+        : [base] "f"(base), [exp] "f"(exp)
+    );
     return result;
 }
 

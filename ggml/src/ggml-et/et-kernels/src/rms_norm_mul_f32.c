@@ -121,9 +121,19 @@ int entry_point(struct ggml_et_rms_norm_mul_params* params, void* env) {
                 :: "t0", "f1", "f2", "f3", "f4", "f5"
             );
 
-            // Step 2: Compute mean of squares and scale factor
-            const float mean = et_fdiv(sum, (float)(int32_t)ne0);
-            const float scale = et_powf(mean + eps, -0.5f);
+            // Step 2: Compute mean of squares and scale factor.
+            // et_fdiv and et_powf each independently save/set/restore the
+            // vector mask to the same single-lane value; since they run
+            // back-to-back with nothing else touching the mask in between,
+            // set it once here instead of twice. MUST restore before the
+            // Step 3 vectorized loop below, which needs the ambient
+            // (0xFF) mask.
+            unsigned long saved_mask;
+            __asm__ volatile("mova.x.m %0" : "=r"(saved_mask));
+            __asm__ volatile("mov.m.x m0, x0, 1");
+            const float mean = et_fdiv_masked(sum, (float)(int32_t)ne0);
+            const float scale = et_powf_masked(mean + eps, -0.5f);
+            __asm__ volatile("mova.m.x %0" :: "r"(saved_mask));
 
             // Numerical stability check
             if (!(scale > 0.0f)) {
