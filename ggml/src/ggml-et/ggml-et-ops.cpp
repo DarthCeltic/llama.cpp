@@ -160,6 +160,39 @@ bool ggml_et_op_scale(ggml_backend_et_device_context* dev_ctx, const ggml_tensor
     return kernel_result;
 }
 
+bool ggml_et_op_ssm_conv(ggml_backend_et_device_context* dev_ctx, const ggml_tensor* node) {
+    ET_PERF_START();
+
+    if (!dev_ctx || !node) {
+        GGML_LOG_ERROR("ET: Invalid parameters for SSM_CONV operation\n");
+        return false;
+    }
+
+    if (!node->src[0] || !node->src[1]) {
+        GGML_LOG_ERROR("ET: SSM_CONV operation missing required inputs\n");
+        return false;
+    }
+
+    if (node->type != GGML_TYPE_F32 || node->src[0]->type != GGML_TYPE_F32 || node->src[1]->type != GGML_TYPE_F32) {
+        GGML_LOG_ERROR("ET: SSM_CONV operation with unsupported types: dst=%s src0=%s src1=%s\n",
+                       ggml_type_name(node->type),
+                       ggml_type_name(node->src[0]->type),
+                       ggml_type_name(node->src[1]->type));
+        return false;
+    }
+
+    ggml_et_ssm_conv_params params;
+    params.src0 = *node->src[0];
+    params.src1 = *node->src[1];
+    params.dst  = *node;
+
+    bool kernel_result = ggml_et_launch_kernel(dev_ctx, "ssm_conv_f32", &params, sizeof(params), 0xFFFFFFFF);
+
+    ET_PERF_END_EXT("SSM_CONV", "ssm_conv_f32", node, "d_conv=%lld|d_inner=%lld",
+                     (long long)node->src[1]->ne[0], (long long)node->src[0]->ne[1]);
+    return kernel_result;
+}
+
 bool ggml_et_op_mul(ggml_backend_et_device_context* dev_ctx, const ggml_tensor* node) {
     // Delegate to generic element map operation
     return ggml_et_op_elmap(dev_ctx, node);

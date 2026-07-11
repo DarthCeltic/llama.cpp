@@ -132,7 +132,14 @@ struct ggml_et_scale_params {
     float bias;           // Bias (additive offset)
 };
 
+struct ggml_et_ssm_conv_params {
+    ggml_tensor src0;     // conv_x: {d_conv-1+n_t, d_inner, n_seqs}, F32
+    ggml_tensor src1;     // conv1d.weight: {d_conv, d_inner}, F32
+    ggml_tensor dst;      // {d_inner, n_t, n_seqs}, F32
+};
+
 bool ggml_et_op_scale(ggml_backend_et_device_context* dev_ctx, const ggml_tensor* node);
+bool ggml_et_op_ssm_conv(ggml_backend_et_device_context* dev_ctx, const ggml_tensor* node);
 bool ggml_et_op_mul(ggml_backend_et_device_context* dev_ctx, const ggml_tensor* node);
 bool ggml_et_op_add(ggml_backend_et_device_context* dev_ctx, const ggml_tensor* node);
 bool ggml_et_op_sub(ggml_backend_et_device_context* dev_ctx, const ggml_tensor* node);

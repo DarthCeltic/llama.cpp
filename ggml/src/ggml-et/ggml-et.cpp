@@ -639,6 +639,10 @@ static enum ggml_status ggml_backend_et_graph_compute(ggml_backend_t backend, gg
                 ggml_et_op_scale(dev_ctx, node);
                 break;
 
+            case GGML_OP_SSM_CONV:
+                ggml_et_op_ssm_conv(dev_ctx, node);
+                break;
+
             case GGML_OP_GLU:
                 ggml_et_op_glu(dev_ctx, node);
                 break;
@@ -800,6 +804,19 @@ static bool ggml_backend_et_device_supports_op(ggml_backend_dev_t dev, const ggm
                        ggml_is_contiguous(op) &&
                        ggml_is_contiguous(op->src[0]) &&
                        (ggml_nelements(op) % 16 == 0);
+            break;
+        case GGML_OP_SSM_CONV:
+            // Support F32 causal depthwise conv (LFM2-style shortconv). Requires
+            // row-contiguous src0/src1 (nb[0]==sizeof(float), src0's sliding-window
+            // row length == ne[0]*sizeof(float)) -- matches ggml_compute_forward_ssm_conv_f32's
+            // own GGML_ASSERT and is what the kernel's flat element indexing relies on.
+            supported = op->type == GGML_TYPE_F32 &&
+                       op->src[0] && op->src[0]->type == GGML_TYPE_F32 &&
+                       op->src[1] && op->src[1]->type == GGML_TYPE_F32 &&
+                       op->src[0]->nb[0] == sizeof(float) &&
+                       op->src[1]->nb[0] == sizeof(float) &&
+                       op->src[0]->nb[1] == op->src[0]->ne[0] * sizeof(float) &&
+                       op->ne[0] == op->src[0]->ne[1];
             break;
         case GGML_OP_GLU:
             // Support F32 GLU operations (split tensor mode only)

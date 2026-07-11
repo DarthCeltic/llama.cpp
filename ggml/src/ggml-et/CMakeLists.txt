@@ -44,6 +44,7 @@ set(KERNELS
     cont_f16
     set_rows_f32
     memops
+    ssm_conv_f32
 )
 
 # Build ET kernels (cross-compiled in subdirectory scope)
