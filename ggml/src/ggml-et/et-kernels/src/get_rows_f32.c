@@ -168,6 +168,37 @@ static void dequantize_q8_0_block_cache_aligned(const block_q8_0* block, float* 
     __asm__ volatile("mova.m.x %0" :: "r"(temp_mask));
 }
 
+// Masked variant of dequantize_q8_0_block_cache_aligned -- skips the
+// per-call mask save/set/restore. copy_q8_0_row_cache_aligned calls this
+// once per block_idx with the same 0xFF need every time; caller brackets
+// the mask once around that loop instead. Mask CSR state is untouched by
+// anything else between calls.
+static void dequantize_q8_0_block_cache_aligned_masked(const block_q8_0* block, float* dst) {
+    const int8_t* qs_ptr = block->qs;
+
+    const int32_t __attribute__((aligned(32))) vec_indices[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+    float scale = fp16_to_fp32(block->d);
+    __asm__ volatile (
+        "fbcx.ps     f0, %0       \n\t"
+        "flq2        f1, 0(%1)    \n\t"
+        :: "r"(scale), "r"(vec_indices)
+        : "f0", "f1"
+    );
+
+    for (int i = 0; i < 4; i++) {
+        __asm__ volatile (
+            "fgb.ps      f2, f1(%0)   \n\t"
+            "fcvt.ps.pw  f2, f2, rne  \n\t"
+            "fmul.ps     f2, f2, f0   \n\t"
+            "fsq2        f2, 0(%1)    \n\t"
+            :: "r"(qs_ptr), "r"(dst)
+            : "f2", "memory"
+        );
+        qs_ptr += 8;
+        dst += 8;
+    }
+}
+
 // Copy a row of Q4_0 data to F32 destination (with dequantization), cache-aligned
 static void copy_q4_0_row_cache_aligned(float* dst, const block_q4_0* src_blocks, int64_t num_elements) {
     const int64_t num_blocks = (num_elements + QK4_0 - 1) / QK4_0;
@@ -242,19 +273,29 @@ static void copy_q8_0_row_cache_aligned(float* dst, const block_q8_0* src_blocks
     // Number of Q8_0 blocks needed for this row
     const int64_t num_blocks = (num_elements + QK8_0 - 1) / QK8_0;  // Round up to handle partial blocks
 
+    // dequantize_q8_0_block_cache_aligned is called once per block_idx below
+    // with the same 0xFF mask need every time -- set it once here instead
+    // of on every call. Mask CSR state is untouched by anything else
+    // between these two asm blocks.
+    unsigned long saved_mask;
+    __asm__ volatile("mova.x.m %0" : "=r"(saved_mask));
+    __asm__ volatile("mov.m.x m0, x0, 0xFF");
+
     for (int64_t block_idx = 0; block_idx < num_blocks; block_idx++) {
         const int64_t elements_in_block = (block_idx == num_blocks - 1) ?
             (num_elements - block_idx * QK8_0) : QK8_0;  // Handle last partial block
 
         // Dequantize the block
         float temp_buffer[QK8_0];
-        dequantize_q8_0_block_cache_aligned(&src_blocks[block_idx], temp_buffer);
+        dequantize_q8_0_block_cache_aligned_masked(&src_blocks[block_idx], temp_buffer);
 
         // Copy dequantized values to destination
         for (int64_t i = 0; i < elements_in_block; i++) {
             dst[block_idx * QK8_0 + i] = temp_buffer[i];
         }
     }
+
+    __asm__ volatile("mova.m.x %0" :: "r"(saved_mask));
 }
 
 
