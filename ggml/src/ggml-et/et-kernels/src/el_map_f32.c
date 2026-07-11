@@ -39,6 +39,26 @@ static inline void block_mul_cache_aligned(float* dst_block, const float* src0_b
     __asm__ volatile("mova.m.x %0" :: "r"(temp_mask));
 }
 
+// Same as block_mul_cache_aligned but skips the per-call mask save/set/
+// restore -- entry_point's operation is fixed for its whole double loop
+// ('for ir... for r...'), so this gets called repeatedly with the same
+// 0xFF need every time. Caller brackets the mask once around that loop.
+static inline void block_mul_cache_aligned_masked(float* dst_block, const float* src0_block, const float* src1_block, int elements) {
+    int32_t vec_end = (elements / 8) * 8;
+    for (int32_t i = 0; i < vec_end; i += 8) {
+        __asm__ volatile(
+            "flw.ps f10, %[src0_vec]\n"
+            "flw.ps f11, %[src1_vec]\n"
+            "fmul.ps f12, f10, f11\n"
+            "fsw.ps f12, %[dst_vec]\n"
+            : [dst_vec] "=m"(*(float(*)[8])&dst_block[i])
+            : [src0_vec] "m"(*(const float(*)[8])&src0_block[i]),
+              [src1_vec] "m"(*(const float(*)[8])&src1_block[i])
+            : "f10", "f11", "f12"
+        );
+    }
+}
+
 static inline void block_add_cache_aligned(float* dst_block, const float* src0_block, const float* src1_block, int elements) {
     // Process 8 elements at a time using vector addition
     int32_t vec_end = (elements / 8) * 8;
@@ -65,6 +85,23 @@ static inline void block_add_cache_aligned(float* dst_block, const float* src0_b
 
     // Restore original mask
     __asm__ volatile("mova.m.x %0" :: "r"(temp_mask));
+}
+
+// Masked variant of block_add_cache_aligned -- see block_mul_cache_aligned_masked.
+static inline void block_add_cache_aligned_masked(float* dst_block, const float* src0_block, const float* src1_block, int elements) {
+    int32_t vec_end = (elements / 8) * 8;
+    for (int32_t i = 0; i < vec_end; i += 8) {
+        __asm__ volatile(
+            "flw.ps f10, %[src0_vec]\n"
+            "flw.ps f11, %[src1_vec]\n"
+            "fadd.ps f12, f10, f11\n"
+            "fsw.ps f12, %[dst_vec]\n"
+            : [dst_vec] "=m"(*(float(*)[8])&dst_block[i])
+            : [src0_vec] "m"(*(const float(*)[8])&src0_block[i]),
+              [src1_vec] "m"(*(const float(*)[8])&src1_block[i])
+            : "f10", "f11", "f12"
+        );
+    }
 }
 
 static inline void block_sub_cache_aligned(float* dst_block, const float* src0_block, const float* src1_block, int elements) {
@@ -95,6 +132,22 @@ static inline void block_sub_cache_aligned(float* dst_block, const float* src0_b
     __asm__ volatile("mova.m.x %0" :: "r"(temp_mask));
 }
 
+// Masked variant of block_sub_cache_aligned -- see block_mul_cache_aligned_masked.
+static inline void block_sub_cache_aligned_masked(float* dst_block, const float* src0_block, const float* src1_block, int elements) {
+    int32_t vec_end = (elements / 8) * 8;
+    for (int32_t i = 0; i < vec_end; i += 8) {
+        __asm__ volatile(
+            "flw.ps f10, %[src0_vec]\n"
+            "flw.ps f11, %[src1_vec]\n"
+            "fsub.ps f12, f10, f11\n"
+            "fsw.ps f12, %[dst_vec]\n"
+            : [dst_vec] "=m"(*(float(*)[8])&dst_block[i])
+            : [src0_vec] "m"(*(const float(*)[8])&src0_block[i]),
+              [src1_vec] "m"(*(const float(*)[8])&src1_block[i])
+            : "f10", "f11", "f12"
+        );
+    }
+}
 
 int entry_point(struct ggml_et_binary_params* params, void* env) {
     kernel_environment_t* kernel_env = (kernel_environment_t*)env;
@@ -161,6 +214,15 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
         return 1;
     }
 
+    // operation is fixed for this whole call (validated above, never
+    // changes per-iteration), so every block_*_cache_aligned call in the
+    // loop below needs the identical 0xFF mask -- set it once here instead
+    // of on every (ir,r) call. Mask CSR state is untouched by anything else
+    // between these two asm blocks.
+    unsigned long saved_mask;
+    __asm__ volatile("mova.x.m %0" : "=r"(saved_mask));
+    __asm__ volatile("mov.m.x m0, x0, 0xFF");
+
     for (int64_t ir = start_row; ir < end_row; ir++) {
         // Convert flat row index to 3D coordinates
         const int64_t i03 = ir / (ne2 * ne1);
@@ -187,19 +249,21 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
 
             switch (operation) {
                 case GGML_OP_MUL:
-                    block_mul_cache_aligned(dst_block, src0_block, src1_ptr, (int)ne10);
+                    block_mul_cache_aligned_masked(dst_block, src0_block, src1_ptr, (int)ne10);
                     break;
                 case GGML_OP_ADD:
-                    block_add_cache_aligned(dst_block, src0_block, src1_ptr, (int)ne10);
+                    block_add_cache_aligned_masked(dst_block, src0_block, src1_ptr, (int)ne10);
                     break;
                 case GGML_OP_SUB:
-                    block_sub_cache_aligned(dst_block, src0_block, src1_ptr, (int)ne10);
+                    block_sub_cache_aligned_masked(dst_block, src0_block, src1_ptr, (int)ne10);
                     break;
                 default:
+                    __asm__ volatile("mova.m.x %0" :: "r"(saved_mask));
                     return 1;
             }
         }
     }
 
+    __asm__ volatile("mova.m.x %0" :: "r"(saved_mask));
     return 0;
 }

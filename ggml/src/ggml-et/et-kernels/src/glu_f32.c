@@ -114,6 +114,50 @@ static inline void block_geglu(float* dst_block, const float* x_block, const flo
     __asm__ volatile("mova.m.x %0" :: "r"(temp_mask));
 }
 
+// Masked variant of block_geglu -- skips the per-call mask save/set/
+// restore. entry_point's glu_op_type is fixed for its whole call (validated
+// once, never changes per-iteration), so block_geglu gets called repeatedly
+// with the same 0xFF need; caller brackets the mask once around that loop
+// instead. Mask CSR state is untouched by anything else between calls.
+static inline void block_geglu_masked(float* dst_block, const float* x_block, const float* g_block, int elements) {
+    float one_const       = 1.0f;
+    float coef_a_const    = 0.044715f;
+    float sqrt2pi_const   = 0.79788456080286535587989211986876f;
+    float two_log2e_const = 2.8853900817779268f;
+
+    for (int32_t i = 0; i < elements; i += 8) {
+        __asm__ volatile(
+            "flw.ps f10, %[x_vec]\n"
+            "flw.ps f11, %[g_vec]\n"
+            "fbc.ps f20, %[one_ptr]\n"
+            "fbc.ps f22, %[coef_ptr]\n"
+            "fbc.ps f23, %[sqrt2pi_ptr]\n"
+            "fbc.ps f24, %[two_log2e_ptr]\n"
+            "fmul.ps f12, f10, f10\n"
+            "fmadd.ps f13, f22, f12, f20\n"
+            "fmul.ps f14, f23, f10\n"
+            "fmul.ps f14, f14, f13\n"
+            "fmul.ps f15, f14, f24\n"
+            "fexp.ps f15, f15\n"
+            "fadd.ps f16, f15, f20\n"
+            "frcp.ps f16, f16\n"
+            "fsub.ps f16, f20, f16\n"
+            "fmul.ps f16, f10, f16\n"
+            "fmul.ps f18, f16, f11\n"
+            "fsw.ps f18, %[dst_out]\n"
+            : [dst_out] "=m"(*(float(*)[8])&dst_block[i])
+            : [x_vec] "m"(*(const float(*)[8])&x_block[i]),
+              [g_vec] "m"(*(const float(*)[8])&g_block[i]),
+              [one_ptr] "m"(one_const),
+              [coef_ptr] "m"(coef_a_const),
+              [sqrt2pi_ptr] "m"(sqrt2pi_const),
+              [two_log2e_ptr] "m"(two_log2e_const)
+            : "f10", "f11", "f12", "f13", "f14", "f15", "f16", "f18",
+              "f20", "f22", "f23", "f24"
+        );
+    }
+}
+
 // Vectorized SwiGLU block processing (16 elements = 1 cache line)
 static inline void block_swiglu(float* dst_block, const float* x_block, const float* g_block, int elements) {
     // Process 8 elements at a time using vector instructions
@@ -181,6 +225,45 @@ static inline void block_swiglu(float* dst_block, const float* x_block, const fl
     __asm__ volatile("mova.m.x %0" :: "r"(temp_mask));
 
     // Handle remaining elements (< 8) with scalar operations
+    for (int32_t i = vec_end; i < elements; i++) {
+        dst_block[i] = silu_f32(x_block[i]) * g_block[i];
+    }
+}
+
+// Masked variant of block_swiglu -- see block_geglu_masked.
+static inline void block_swiglu_masked(float* dst_block, const float* x_block, const float* g_block, int elements) {
+    int32_t vec_end = (elements / 8) * 8;
+
+    float zero_const = 0.0f;
+    float one_const = 1.0f;
+    float log2e_const = 1.4426950408889634f;
+
+    for (int32_t i = 0; i < vec_end; i += 8) {
+        __asm__ volatile(
+            "flw.ps f10, %[x_vec]\n"
+            "flw.ps f11, %[g_vec]\n"
+            "fbc.ps f20, %[zero_ptr]\n"
+            "fbc.ps f21, %[one_ptr]\n"
+            "fsub.ps f12, f20, f10\n"
+            "fbc.ps f22, %[log2e_ptr]\n"
+            "fmul.ps f13, f12, f22\n"
+            "fexp.ps f14, f13\n"
+            "fadd.ps f15, f14, f21\n"
+            "frcp.ps f16, f15\n"
+            "fmul.ps f17, f10, f16\n"
+            "fmul.ps f18, f17, f11\n"
+            "fsw.ps f18, %[dst_out]\n"
+            : [dst_out] "=m"(*(float(*)[8])&dst_block[i])
+            : [x_vec] "m"(*(const float(*)[8])&x_block[i]),
+              [g_vec] "m"(*(const float(*)[8])&g_block[i]),
+              [zero_ptr] "m"(zero_const),
+              [one_ptr] "m"(one_const),
+              [log2e_ptr] "m"(log2e_const)
+            : "f10", "f11", "f12", "f13", "f14", "f15", "f16", "f17", "f18", "f20", "f21", "f22"
+        );
+    }
+
+    // Handle remaining elements (< 8) with scalar operations (no mask needed)
     for (int32_t i = vec_end; i < elements; i++) {
         dst_block[i] = silu_f32(x_block[i]) * g_block[i];
     }
@@ -278,6 +361,15 @@ int entry_point(struct ggml_et_glu_params* params, void* env) {
         return 0;
     }
 
+    // glu_op_type is fixed for this whole call (validated above, never
+    // changes per-iteration), so every block_geglu/block_swiglu call in the
+    // loop below needs the identical 0xFF mask -- set it once here instead
+    // of on every segment call. Mask CSR state is untouched by anything
+    // else between these two asm blocks.
+    unsigned long saved_mask;
+    __asm__ volatile("mova.x.m %0" : "=r"(saved_mask));
+    __asm__ volatile("mov.m.x m0, x0, 0xFF");
+
     // Process cache lines assigned to this thread
     for (int64_t cl = start_cacheline; cl < end_cacheline; cl++) {
         // Map cache line back to element coordinates
@@ -329,9 +421,9 @@ int entry_point(struct ggml_et_glu_params* params, void* env) {
 
             // Process this segment
             if (params->glu_op_type == GGML_GLU_OP_GEGLU) {
-                block_geglu(dst_ptr, x_ptr, g_ptr, (int)elements_to_process);
+                block_geglu_masked(dst_ptr, x_ptr, g_ptr, (int)elements_to_process);
             } else {
-                block_swiglu(dst_ptr, x_ptr, g_ptr, (int)elements_to_process);
+                block_swiglu_masked(dst_ptr, x_ptr, g_ptr, (int)elements_to_process);
             }
 
             // Update counters
@@ -346,5 +438,6 @@ int entry_point(struct ggml_et_glu_params* params, void* env) {
         }
     }
 
+    __asm__ volatile("mova.m.x %0" :: "r"(saved_mask));
     return 0;
 }
