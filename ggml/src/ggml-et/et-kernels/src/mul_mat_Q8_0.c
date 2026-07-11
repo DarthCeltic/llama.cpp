@@ -112,11 +112,24 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
                     const block_q8_0* q_row = (const block_q8_0*)(src0_ptr2 + m * nb01);
                     float sum = 0.0f;
 
+                    // Set the vector mask ONCE for this row's whole K_blocks
+                    // loop instead of paying a save/set/restore CSR sequence
+                    // on every 32-element block call -- see
+                    // compute_block_dot_product_q8_0_masked in block_ops.h.
+                    // Mask CSR state is untouched by anything else between
+                    // these two asm blocks, so this is value-identical to
+                    // the per-call save/set/restore it replaces.
+                    unsigned long saved_mask;
+                    __asm__ volatile("mova.x.m %0" : "=r"(saved_mask));
+                    __asm__ volatile("mov.m.x m0, x0, 0xFF");
+
                     for (int64_t kb = 0; kb < K_blocks; kb++) {
                         // q_row is a pointer to blocks, so + kb moves by sizeof(block_q8_0)
                         // b_col is float*, so we move 32 elements (kb << 5)
-                        sum += compute_block_dot_product_q8_0(q_row + kb, b_col_base + (kb << 5));
+                        sum += compute_block_dot_product_q8_0_masked(q_row + kb, b_col_base + (kb << 5));
                     }
+
+                    __asm__ volatile("mova.m.x %0" :: "r"(saved_mask));
 
                     // Store result in dst[m, n, i2, i3]
                     float* dst_entry = (float*)(dst_ptr2 + n * nbd1 + m * sizeof(float));
