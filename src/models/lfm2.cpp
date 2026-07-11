@@ -112,6 +112,11 @@ llm_build_lfm2<iswa>::llm_build_lfm2(const llama_model & model, const llm_graph_
 
         bx = ggml_concat(ctx0, conv, bx, 0);
         GGML_ASSERT(bx->ne[0] > conv->ne[0]);
+        // GGML_OP_CONCAT is unsupported on the ET backend (falls back to a CPU
+        // partition); force materialization into a fresh backend-resident buffer
+        // via GGML_OP_CONT (which IS ET-supported) before ssm_conv reads it below --
+        // diagnostic fix for a suspected stale/cross-backend pointer fault.
+        bx = ggml_cont(ctx0, bx);
 
         // last d_conv columns is a new conv state
         auto * new_conv = ggml_view_3d(ctx0, bx, conv->ne[0], bx->ne[1], bx->ne[2], bx->nb[1], bx->nb[2],
