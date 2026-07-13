@@ -116,22 +116,57 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
         // N edge: last tile may have fewer than 16 rows
         const int64_t n_cur = (nb + TILE <= N) ? TILE : (N - nb);
 
+        // Latency-hiding K-loop, adapted from the vendor's own reference
+        // pattern (et-platform/test-compute-kernels/src/tl_tfma_fc/
+        // tl_tfma_fc.c and coop_tl_tfma_2s/coop_tl_tfma_2s.c): the A tile
+        // ("plain load") alternates between two 16-line SCP zones (line 0
+        // and line 32, the latter previously unused -- this kernel's own
+        // header comment already notes only 32 of 48 SCP lines are used).
+        // The NEXT iteration's A tile is issued right after the CURRENT
+        // iteration's tensor_fma (not waited on), so its load latency runs
+        // concurrently with the FMA's compute time instead of serially
+        // before it -- the exact "latency hiding" the PRM recommends per
+        // this file's own long-standing XXX comment below, which was never
+        // implemented. B ("transpose load") is left untouched, still fully
+        // serial each iteration, matching the vendor pattern's own
+        // asymmetric treatment (only one of the two loads is prefetched).
+        //
+        // Correctness invariants (checked, not assumed):
+        //   - A's two alternating zones (0, 32) never overlap B's fixed
+        //     zone (16) or each other.
+        //   - The FMA for iteration kb reads A from whichever zone holds
+        //     kb's already-loaded, already-waited-on data (`a_cur`); the
+        //     prefetch issued right after it targets the OTHER zone
+        //     (`a_next`), which is guaranteed not to be the zone the FMA
+        //     is reading from -- no write-during-read hazard.
+        //   - The prefetch's own completion is explicitly waited on at the
+        //     TOP of the next iteration (a separate wait from the previous
+        //     iteration's FMA wait) before that data is ever used as FMA
+        //     input -- this is NOT assumed to "have had enough time";
+        //     it is a real, explicit tensor_wait every iteration.
+        const int64_t a_zone[2] = {0, 32};
+        int64_t a_slot = 0;   // index into a_zone: which zone holds the CURRENT tile
+
+        // Prologue: load kb=0's A tile into zone 0 before the loop starts.
+        tensor_load(
+            false, false,
+            (uint64_t)a_zone[0],
+            0,                                                          // plain load
+            0,
+            (uint64_t)(src1_batch + nb * nb1_1),
+            0,
+            n_cur - 1,
+            (uint64_t)nb1_1,
+            0
+        );
+        tensor_wait(TENSOR_LOAD_WAIT_0);
+
         // Accumulate across K (always full 16-wide chunks)
         for (int64_t kb = 0; kb < K; kb += TILE) {
-            // A = src1[nb:nb+n_cur-1][kb:kb+15] -> SCP 0:n_cur-1
-            tensor_load(
-                false, false,
-                0,                                                          // SCP line 0
-                0,                                                          // plain load
-                0,
-                (uint64_t)(src1_batch + nb * nb1_1 + kb * sizeof(float)),
-                0,
-                n_cur - 1,                                                  // N edge
-                (uint64_t)nb1_1,
-                0
-            );
+            const int64_t a_cur  = a_zone[a_slot];
+            const int64_t a_next = a_zone[a_slot ^ 1];
 
-            // B = transpose(src0[mb:mb+15][kb:kb+15]) -> SCP 16:31
+            // B = transpose(src0[mb:mb+15][kb:kb+15]) -> SCP 16:31 (unchanged, fully serial)
             tensor_load(
                 false, false,
                 TILE,                                                       // SCP line 16
@@ -143,8 +178,6 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
                 (uint64_t)nb1_0,
                 1
             );
-
-            tensor_wait(TENSOR_LOAD_WAIT_0);
             tensor_wait(TENSOR_LOAD_WAIT_1);
 
             tensor_fma(
@@ -156,7 +189,7 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
                 false, false, false,
                 false,
                 TILE,           // BSTART=16
-                0,              // ASTART=0
+                (uint64_t)a_cur,// ASTART: alternates 0/32, never the zone being prefetched into below
                 0,              // TensorFMA32
                 (kb == 0)       // first pass: overwrite; else: accumulate
             );
@@ -166,7 +199,32 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
             // XXX: This also means that if the compiler tried to carry any FP value across tensor_fma
             //      without spilling - it breaks.
 
+            // Prefetch the NEXT tile's A into the zone NOT being read by the
+            // FMA just issued above -- issued before waiting on that FMA, so
+            // the load latency overlaps the FMA's compute time.
+            const int64_t kb_next = kb + TILE;
+            if (kb_next < K) {
+                tensor_load(
+                    false, false,
+                    (uint64_t)a_next,
+                    0,
+                    0,
+                    (uint64_t)(src1_batch + nb * nb1_1 + kb_next * sizeof(float)),
+                    0,
+                    n_cur - 1,
+                    (uint64_t)nb1_1,
+                    0
+                );
+            }
+
             tensor_wait(TENSOR_FMA_WAIT);
+            if (kb_next < K) {
+                // Explicit wait for the prefetch issued above -- required
+                // before the next iteration's FMA reads a_next, not assumed
+                // safe just because time has passed.
+                tensor_wait(TENSOR_LOAD_WAIT_0);
+                a_slot ^= 1;
+            }
         }
 
         // Store n_cur rows x 64 bytes
