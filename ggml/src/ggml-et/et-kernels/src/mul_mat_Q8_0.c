@@ -112,6 +112,30 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
                     const block_q8_0* q_row = (const block_q8_0*)(src0_ptr2 + m * nb01);
                     float sum = 0.0f;
 
+                    // Prefetch THIS hart's own next row (m + stride_m) into
+                    // L2 before computing the current one, so its memory
+                    // latency overlaps this row's compute time instead of
+                    // stalling the next iteration. prefetch_weight_row was
+                    // already written (block_ops.h-adjacent, defined at the
+                    // top of this file) but never called anywhere in this
+                    // codebase -- confirmed via full-tree grep. It splits a
+                    // row's cache lines into 8 slices keyed by worker_id%8;
+                    // called 8 times here (by this same hart, for its own
+                    // next row) to prefetch the complete row, not the
+                    // cooperative multi-hart split its 8-way design may have
+                    // originally intended -- that pattern doesn't fit this
+                    // loop's per-hart-independent-row access pattern anyway.
+                    // This is a pure prefetch HINT (csrw to a prefetch CSR,
+                    // per the function's own comment) -- a wrong or useless
+                    // target cannot corrupt output, only fail to help.
+                    const int64_t m_next = m + stride_m;
+                    if (m_next < M) {
+                        const void* next_row_ptr = (const void*)(src0_ptr2 + m_next * nb01);
+                        for (uint32_t w = 0; w < 8; w++) {
+                            prefetch_weight_row(next_row_ptr, K_blocks, w);
+                        }
+                    }
+
                     // Set the vector mask ONCE for this row's whole K_blocks
                     // loop instead of paying a save/set/restore CSR sequence
                     // on every 32-element block call -- see
