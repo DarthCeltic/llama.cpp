@@ -70,6 +70,14 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
     // Broadcasting support
     const int64_t r2 = ne12 / ne02;
     const int64_t r3 = ne13 / ne03;
+    // No-broadcast case (e.g. standard multi-head attention without GQA):
+    // i02/i03 collapse to i2/i3 exactly, since dividing by 1 is the
+    // identity. Checked once per kernel call (loop-invariant), not
+    // assumed -- the original r2/r3 division is kept as the exact
+    // fallback whenever broadcasting is actually in effect (r2>1 or
+    // r3>1, e.g. real GQA). Same pattern already verified and shipped
+    // in mul_mat_f32_matrix_engine.c.
+    const bool no_broadcast = (r2 == 1 && r3 == 1);
 
     for (uint64_t base_idx = effective_thread_id * per_thread; base_idx < total_elements; base_idx += threads_stride) {
         for (uint64_t j = 0; j < per_thread; j++) {
@@ -84,7 +92,8 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
             const int64_t n = rem2 / M;
             const int64_t m = rem2 % M;
 
-            const int64_t i03 = i3 / r3, i02 = i2 / r2;
+            const int64_t i03 = no_broadcast ? i3 : i3 / r3;
+            const int64_t i02 = no_broadcast ? i2 : i2 / r2;
             const int64_t i13 = (ne13 > 1) ? i3 : 0, i12 = (ne12 > 1) ? i2 : 0;
 
             float sum = 0.0f;
