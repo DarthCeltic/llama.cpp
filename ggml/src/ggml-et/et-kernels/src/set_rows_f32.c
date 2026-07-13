@@ -169,6 +169,15 @@ int entry_point(struct ggml_et_set_rows_params* params, void* env) {
     // Check if rows are cache-line aligned in the destination
     const bool row_cache_aligned = (ne00 >= dst_cl_elems) && (ne00 % dst_cl_elems == 0);
 
+    // No-broadcast case for the index-batch lookup (src1 has no per-head/
+    // per-batch broadcasting dimension): i12 = i03 % ne12 and i11 = i02 %
+    // ne11 are unconditionally 0 when ne12==1 / ne11==1 respectively --
+    // x % 1 == 0 for any integer x, a mathematical fact, not assumed from
+    // the common case. The original modulo is kept as the exact fallback
+    // whenever real broadcasting (ne11>1 or ne12>1) is in effect.
+    const bool no_bcast_11 = (ne11 == 1);
+    const bool no_bcast_12 = (ne12 == 1);
+
     if (row_cache_aligned) {
         // Cache-aligned path: distribute dst cache lines across threads
         // Each thread owns complete cache lines -> no coherence conflicts
@@ -192,8 +201,8 @@ int entry_point(struct ggml_et_set_rows_params* params, void* env) {
             const int64_t i03 = tmp / ne02;
 
             // Look up destination row index
-            const int64_t i12 = i03 % ne12;
-            const int64_t i11 = i02 % ne11;
+            const int64_t i12 = no_bcast_12 ? 0 : i03 % ne12;
+            const int64_t i11 = no_bcast_11 ? 0 : i02 % ne11;
             const int64_t i10 = i01;
             const int64_t index_byte_offset = i10*nb10 + i11*nb11 + i12*nb12;
             const int64_t dst_row_index = *(int64_t*)((char*)src1_data + index_byte_offset);
@@ -227,8 +236,8 @@ int entry_point(struct ggml_et_set_rows_params* params, void* env) {
             const int64_t i03 = tmp / ne02;
 
             // Look up destination row index
-            const int64_t i12 = i03 % ne12;
-            const int64_t i11 = i02 % ne11;
+            const int64_t i12 = no_bcast_12 ? 0 : i03 % ne12;
+            const int64_t i11 = no_bcast_11 ? 0 : i02 % ne11;
             const int64_t i10 = i01;
             const int64_t index_byte_offset = i10*nb10 + i11*nb11 + i12*nb12;
             const int64_t dst_row_index = *(int64_t*)((char*)src1_data + index_byte_offset);
