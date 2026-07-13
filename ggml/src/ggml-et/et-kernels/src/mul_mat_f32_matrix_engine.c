@@ -86,6 +86,13 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
 
     const int64_t r2 = ne2_1 / ne2_0;
     const int64_t r3 = ne3_1 / ne3_0;
+    // No-broadcast case (e.g. standard multi-head attention without GQA,
+    // where src0/src1 share the same head/batch counts): i2_0/i3_0 collapse
+    // to i2/i3 exactly, since dividing by 1 is the identity. Checked once
+    // per kernel call (loop-invariant), not assumed -- the original r2/r3
+    // division is kept as the exact fallback whenever broadcasting is
+    // actually in effect (r2>1 or r3>1, e.g. real GQA).
+    const bool no_broadcast = (r2 == 1 && r3 == 1);
 
     for (int64_t tile = global_id; tile < total_tiles; tile += NUM_HARTS) {
 
@@ -96,8 +103,8 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
 
         const int64_t i3   = batch_idx / ne2_1;
         const int64_t i2   = batch_idx % ne2_1;
-        const int64_t i2_0 = i2 / r2;
-        const int64_t i3_0 = i3 / r3;
+        const int64_t i2_0 = no_broadcast ? i2 : i2 / r2;
+        const int64_t i3_0 = no_broadcast ? i3 : i3 / r3;
 
         const char* src0_batch = src0_base + i3_0 * nb3_0 + i2_0 * nb2_0;
         const char* src1_batch = src1_base + i3   * nb3_1 + i2   * nb2_1;
