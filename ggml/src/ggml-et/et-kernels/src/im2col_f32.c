@@ -64,6 +64,75 @@ int entry_point(struct ggml_et_im2col_params * params, void * env) {
     }
 
     float * output = (float *) dst->data;
+    const char * image_base = (const char *) image->data;
+
+    // Fast path: a 16-element cache-line never straddles a patch boundary
+    // when patch (= channels*kh*kw) is itself a multiple of 16 -- true for
+    // this model (channels=3, kh=kw=16 -> patch=768=48*16). That lets us
+    // hoist the patch-level index decomposition (patch_index/batch/spatial/
+    // out_y/out_x) out of the 16-wide inner loop instead of recomputing it,
+    // via integer division, on every single output element. When kw==16
+    // additionally (also true here), a full line covers exactly one kernel
+    // row, so channel and kernel_y are ALSO constant across the line and
+    // kernel_x is just the loop offset -- eliminating all five divisions
+    // from the innermost loop entirely. Both fast paths are pure algebraic
+    // simplifications of the exact same formula below; the slow path is
+    // kept byte-for-byte identical as a fallback for any shape that doesn't
+    // meet these (checked, not assumed) invariants.
+    if (patch % 16 == 0) {
+        for (int64_t line = first; line < last; ++line) {
+            const int64_t begin = line * 16;
+            const int64_t patch_index = begin / patch;
+            const int64_t kernel_index_base = begin - patch_index * patch;
+            const int64_t batch = patch_index / (oh * ow);
+            const int64_t spatial = patch_index - batch * oh * ow;
+            const int64_t out_y = spatial / ow;
+            const int64_t out_x = spatial - out_y * ow;
+            const int64_t in_x_base = out_x * params->s0 - params->p0;
+            const int64_t in_y = out_y * params->s1 - params->p1;
+            const char * row_base = image_base + batch * image->nb[3];
+
+            if (kw == 16) {
+                const int64_t channel = kernel_index_base / (kh * kw);
+                const int64_t kernel_spatial = kernel_index_base - channel * kh * kw;
+                const int64_t kernel_y = kernel_spatial / kw;
+                const int64_t src_in_y = in_y + kernel_y * params->d1;
+                const char * chan_base = row_base + channel * image->nb[2];
+                const int in_y_ok = (src_in_y >= 0 && src_in_y < ih);
+                const char * y_base = chan_base + src_in_y * image->nb[1];
+                for (int offset = 0; offset < 16; ++offset) {
+                    const int64_t kernel_x = offset;
+                    const int64_t in_x = in_x_base + kernel_x * params->d0;
+                    float value = 0.0f;
+                    if (in_y_ok && in_x >= 0 && in_x < iw) {
+                        value = *(const float *) (y_base + in_x * image->nb[0]);
+                    }
+                    output[begin + offset] = value;
+                }
+                continue;
+            }
+
+            for (int offset = 0; offset < 16; ++offset) {
+                const int64_t kernel_index = kernel_index_base + offset;
+                const int64_t channel = kernel_index / (kh * kw);
+                const int64_t kernel_spatial = kernel_index - channel * kh * kw;
+                const int64_t kernel_y = kernel_spatial / kw;
+                const int64_t kernel_x = kernel_spatial - kernel_y * kw;
+                const int64_t in_x = in_x_base + kernel_x * params->d0;
+                const int64_t src_in_y = in_y + kernel_y * params->d1;
+
+                float value = 0.0f;
+                if (in_x >= 0 && in_x < iw && src_in_y >= 0 && src_in_y < ih) {
+                    const char * address = row_base + channel * image->nb[2] +
+                        src_in_y * image->nb[1] + in_x * image->nb[0];
+                    value = *(const float *) address;
+                }
+                output[begin + offset] = value;
+            }
+        }
+        return 0;
+    }
+
     for (int64_t line = first; line < last; ++line) {
         const int64_t begin = line * 16;
         for (int offset = 0; offset < 16; ++offset) {
@@ -83,7 +152,7 @@ int entry_point(struct ggml_et_im2col_params * params, void * env) {
 
             float value = 0.0f;
             if (in_x >= 0 && in_x < iw && in_y >= 0 && in_y < ih) {
-                const char * address = (const char *) image->data +
+                const char * address = image_base +
                     batch * image->nb[3] + channel * image->nb[2] +
                     in_y * image->nb[1] + in_x * image->nb[0];
                 value = *(const float *) address;
