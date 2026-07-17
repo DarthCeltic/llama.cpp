@@ -91,6 +91,17 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
     const int64_t r2 = ne12 / ne02;
     const int64_t r3 = ne13 / ne03;
 
+    // Largest multiple of 4 <= N. mul_mat_Q8_0 is the dominant cost for
+    // Q8_0-quantized models on this target and is memory-bound: the per-
+    // column loop below re-reads and re-converts every weight block once
+    // per output column. When N >= 4 (prefill / vision-patch batches,
+    // where columns are computed together) this processes 4 columns at a
+    // time so each weight block's gather+convert happens once and is
+    // reused across all 4 -- see compute_block_dot_product_q8_0_masked_x4
+    // in block_ops.h. Single-token decode (N == 1) has nothing to batch
+    // and falls straight through to the unchanged remainder loop below.
+    const int64_t N4 = N & ~(int64_t)3;
+
     for (int64_t i3 = 0; i3 < ne13; i3++) {
         const int64_t i03 = i3 / r3;
         const char* src0_ptr3 = (const char*)params->src0.data + i03 * nb03;
@@ -103,7 +114,58 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
             const char* src1_ptr2 = src1_ptr3 + i2 * nb12;
             char* dst_ptr2       = dst_ptr3 + i2 * nbd2;
 
-            for (int64_t n = 0; n < N; n++) {
+            for (int64_t n = 0; n < N4; n += 4) {
+                // src1 is F32, so column pointers move by nb11
+                const float* b0_col_base = (const float*)(src1_ptr2 + (n + 0) * nb11);
+                const float* b1_col_base = (const float*)(src1_ptr2 + (n + 1) * nb11);
+                const float* b2_col_base = (const float*)(src1_ptr2 + (n + 2) * nb11);
+                const float* b3_col_base = (const float*)(src1_ptr2 + (n + 3) * nb11);
+
+                for (int64_t m = hart_id; m < M; m += stride_m) {
+                    // src0 is Q8_0 blocks, row pointer moves by nb01
+                    const block_q8_0* q_row = (const block_q8_0*)(src0_ptr2 + m * nb01);
+                    float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
+
+                    // Set the vector mask ONCE for this row's whole K_blocks
+                    // loop instead of paying a save/set/restore CSR sequence
+                    // on every 32-element block call -- see
+                    // compute_block_dot_product_q8_0_masked_x4 in
+                    // block_ops.h. Mask CSR state is untouched by anything
+                    // else between these two asm blocks, so this is value-
+                    // identical to the per-call save/set/restore it replaces.
+                    unsigned long saved_mask;
+                    __asm__ volatile("mova.x.m %0" : "=r"(saved_mask));
+                    __asm__ volatile("mov.m.x m0, x0, 0xFF");
+
+                    for (int64_t kb = 0; kb < K_blocks; kb++) {
+                        // q_row is a pointer to blocks, so + kb moves by sizeof(block_q8_0)
+                        // b_col is float*, so we move 32 elements (kb << 5)
+                        float p0, p1, p2, p3;
+                        compute_block_dot_product_q8_0_masked_x4(
+                            q_row + kb,
+                            b0_col_base + (kb << 5), b1_col_base + (kb << 5),
+                            b2_col_base + (kb << 5), b3_col_base + (kb << 5),
+                            &p0, &p1, &p2, &p3);
+                        sum0 += p0; sum1 += p1; sum2 += p2; sum3 += p3;
+                    }
+
+                    __asm__ volatile("mova.m.x %0" :: "r"(saved_mask));
+
+                    // Store results in dst[m, n..n+3, i2, i3]
+                    float* d0 = (float*)(dst_ptr2 + (n + 0) * nbd1 + m * sizeof(float));
+                    float* d1 = (float*)(dst_ptr2 + (n + 1) * nbd1 + m * sizeof(float));
+                    float* d2 = (float*)(dst_ptr2 + (n + 2) * nbd1 + m * sizeof(float));
+                    float* d3 = (float*)(dst_ptr2 + (n + 3) * nbd1 + m * sizeof(float));
+                    atomic_store_f32((volatile float*)d0, sum0);
+                    atomic_store_f32((volatile float*)d1, sum1);
+                    atomic_store_f32((volatile float*)d2, sum2);
+                    atomic_store_f32((volatile float*)d3, sum3);
+                }
+            }
+
+            // Remainder columns (N % 4), and the whole loop when N < 4 (e.g.
+            // single-token decode) -- original per-column path, unchanged.
+            for (int64_t n = N4; n < N; n++) {
                 // src1 is F32, so column pointer moves by nb11
                 const float* b_col_base = (const float*)(src1_ptr2 + n * nb11);
 

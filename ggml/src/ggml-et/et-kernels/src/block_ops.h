@@ -131,6 +131,123 @@ static inline float compute_block_dot_product_q8_0_masked(const block_q8_0* a_bl
     return final_sum * scale;
 }
 
+// Same contract as compute_block_dot_product_q8_0_masked (caller has already
+// set the vector mask to 0xFF), but computes FOUR output columns' partial
+// dot products from a SINGLE gather+int8->f32 convert of this block's weight
+// bytes, instead of repeating that gather+convert once per column.
+//
+// mul_mat_Q8_0 is the dominant cost for Q8_0-quantized models on this target
+// and is memory-bound, not compute-bound: the naive per-column loop re-reads
+// and re-converts every weight block once per output column (N times for an
+// N-wide activation batch), even though the weight bytes never change across
+// columns. This reuses ONE fgb.ps/fcvt.ps.pw per chunk across 4 independent
+// FMA accumulators (one per column), cutting weight-side memory/conversion
+// traffic ~4x whenever 4 output columns are computed together (e.g. prefill/
+// vision-patch batches; single-token decode has nothing to batch and uses
+// the original per-column helper unchanged -- see the N%4 remainder path in
+// mul_mat_Q8_0.c).
+//
+// Value-identical to calling compute_block_dot_product_q8_0_masked once per
+// column: same per-chunk fgb.ps/fcvt.ps.pw/fmadd.ps sequence and the same
+// final *scale, just fanned out over four independent accumulators (f10/
+// f13/f16/f19, chosen to avoid the f11/f12/f31 temporaries already live in
+// the shared gather/convert/load step) instead of one.
+static inline void compute_block_dot_product_q8_0_masked_x4(
+        const block_q8_0* a_block,
+        const float* b0_col_start, const float* b1_col_start,
+        const float* b2_col_start, const float* b3_col_start,
+        float* out0, float* out1, float* out2, float* out3) {
+    __asm__ volatile("fbci.pi f10, 0" ::: "f10");
+    __asm__ volatile("fbci.pi f13, 0" ::: "f13");
+    __asm__ volatile("fbci.pi f16, 0" ::: "f16");
+    __asm__ volatile("fbci.pi f19, 0" ::: "f19");
+
+    static const int32_t gather_pattern[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+
+    __asm__ volatile("flw.ps f31, %[gather]\n" : : [gather] "m"(*(const int32_t(*)[8])gather_pattern) : "f31");
+
+    // Process 32 elements in 4 chunks of 8 elements each
+    for (int chunk = 0; chunk < 4; chunk++) {
+        int offset = chunk << 3; // chunk * 8
+
+        __asm__ volatile(
+            "fgb.ps f11, f31(%[a_ptr])\n"             // Gather 8 int8 bytes from A ONCE
+            "fcvt.ps.pw f11, f11\n"                   // Convert int8 vector to float vector ONCE
+            "flw.ps f12, %[b0_vec]\n"
+            "fmadd.ps f10, f11, f12, f10\n"           // col 0 acc += a_vec * b0_vec
+            "flw.ps f12, %[b1_vec]\n"
+            "fmadd.ps f13, f11, f12, f13\n"           // col 1 acc += a_vec * b1_vec
+            "flw.ps f12, %[b2_vec]\n"
+            "fmadd.ps f16, f11, f12, f16\n"           // col 2 acc += a_vec * b2_vec
+            "flw.ps f12, %[b3_vec]\n"
+            "fmadd.ps f19, f11, f12, f19\n"           // col 3 acc += a_vec * b3_vec
+            :
+            : [a_ptr] "r"(&a_block->qs[offset]),
+              [b0_vec] "m"(*(const float(*)[8])&b0_col_start[offset]),
+              [b1_vec] "m"(*(const float(*)[8])&b1_col_start[offset]),
+              [b2_vec] "m"(*(const float(*)[8])&b2_col_start[offset]),
+              [b3_vec] "m"(*(const float(*)[8])&b3_col_start[offset])
+            : "f10", "f11", "f12", "f13", "f16", "f19"
+        );
+    }
+
+    // Horizontal-reduce each of the 4 accumulators with the exact same
+    // reduction sequence the single-column helper uses, run once per
+    // accumulator (sequentially, so reusing the f1-f5/t0 scratch registers
+    // across the four reductions is safe -- no two reductions overlap).
+    float s0, s1, s2, s3;
+    __asm__ __volatile__ (
+        "fswizz.ps f1, f10, 0xB1 \n\t"
+        "fadd.ps   f2, f10, f1, rne \n\t"
+        "fswizz.ps f3, f2, 0x4E \n\t"
+        "fadd.ps   f4, f2, f3, rne \n\t"
+        "fmvz.x.ps t0, f4, 4 \n\t"
+        "fbcx.ps   f5, t0 \n\t"
+        "fadd.ps   %[vout], f4, f5, rne \n\t"
+        : [vout] "=f" (s0)
+        :: "t0", "f10", "f1", "f2", "f3", "f4", "f5"
+    );
+    __asm__ __volatile__ (
+        "fswizz.ps f1, f13, 0xB1 \n\t"
+        "fadd.ps   f2, f13, f1, rne \n\t"
+        "fswizz.ps f3, f2, 0x4E \n\t"
+        "fadd.ps   f4, f2, f3, rne \n\t"
+        "fmvz.x.ps t0, f4, 4 \n\t"
+        "fbcx.ps   f5, t0 \n\t"
+        "fadd.ps   %[vout], f4, f5, rne \n\t"
+        : [vout] "=f" (s1)
+        :: "t0", "f13", "f1", "f2", "f3", "f4", "f5"
+    );
+    __asm__ __volatile__ (
+        "fswizz.ps f1, f16, 0xB1 \n\t"
+        "fadd.ps   f2, f16, f1, rne \n\t"
+        "fswizz.ps f3, f2, 0x4E \n\t"
+        "fadd.ps   f4, f2, f3, rne \n\t"
+        "fmvz.x.ps t0, f4, 4 \n\t"
+        "fbcx.ps   f5, t0 \n\t"
+        "fadd.ps   %[vout], f4, f5, rne \n\t"
+        : [vout] "=f" (s2)
+        :: "t0", "f16", "f1", "f2", "f3", "f4", "f5"
+    );
+    __asm__ __volatile__ (
+        "fswizz.ps f1, f19, 0xB1 \n\t"
+        "fadd.ps   f2, f19, f1, rne \n\t"
+        "fswizz.ps f3, f2, 0x4E \n\t"
+        "fadd.ps   f4, f2, f3, rne \n\t"
+        "fmvz.x.ps t0, f4, 4 \n\t"
+        "fbcx.ps   f5, t0 \n\t"
+        "fadd.ps   %[vout], f4, f5, rne \n\t"
+        : [vout] "=f" (s3)
+        :: "t0", "f19", "f1", "f2", "f3", "f4", "f5"
+    );
+
+    const float scale = fp16_to_fp32(a_block->d);
+    *out0 = s0 * scale;
+    *out1 = s1 * scale;
+    *out2 = s2 * scale;
+    *out3 = s3 * scale;
+}
+
 
 // Compute dot product between f16 block and f32 column vector (NAIVE VERSION)
 // Scalar implementation for debugging - no vectorization
