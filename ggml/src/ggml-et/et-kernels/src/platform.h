@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include "etsoc/isa/hart.h"
 #include "etsoc/common/utils.h"
+#include "etsoc/isa/barriers.h"  // shire_barrier(), used by et_barrier() below
 
 #define SOC_MINIONS_PER_SHIRE 32
 #define NUM_HARTS_PER_MINION 2
@@ -79,7 +80,8 @@ static inline int get_num_threads(uint64_t shire_mask) {
 //******************************************************************************
 
 #define NOP   __asm__ __volatile__ ("nop\n");
-#define FENCE __asm__ __volatile__ ("fence\n");
+// "memory" clobber added so FENCE also acts as a compiler barrier for the SCP-signaling primitives below.
+#define FENCE __asm__ __volatile__ ("fence\n" ::: "memory");
 #define WFI   __asm__ __volatile__ ("wfi\n");
 
 //******************************************************************************
@@ -202,6 +204,90 @@ static inline void atomic_store_f16(volatile uint16_t* addr, uint16_t value) {
         : "r"(addr), "r"(value)
         : "memory"
     );
+}
+
+// Minion-scope barrier: syncs both harts within a minion (FLB=minion_id, FCC 0). Only scope currently in use.
+typedef enum {
+    ET_BARRIER_MINION,
+} et_barrier_scope_t;
+
+static inline uint64_t __attribute__((always_inline)) et_barrier(et_barrier_scope_t scope) {
+    (void) scope;
+    uint32_t local_minion = (get_hart_id() >> 1) & 0x1F;
+    uint32_t mask         = 1u << local_minion;
+    return shire_barrier(local_minion, 0, 2, mask, mask);
+}
+
+#define L2SCP_BASE        0x0080000000ULL
+#define L2SCP_SHIRE_LOCAL 0x7FULL
+
+// Local-shire L2 SCP address (no cross-shire traffic).
+static inline void * __attribute__((always_inline)) et_shire_l2scp_local(uint64_t offset) {
+    return (void *) (L2SCP_BASE | (L2SCP_SHIRE_LOCAL << 23) | (offset & 0x7FFFFF));
+}
+
+// Flushes nlines (max 16, 4-bit field) cache lines from L1 to L2 via FlushVA. Caller FENCEs before, WAIT_CACHEOPS after.
+static inline void __attribute__((always_inline)) flush_to_l2(const void * addr, uint64_t nlines, uint64_t stride) {
+    uint64_t csr_val = (0x1ULL << 58) | ((uint64_t) addr & 0xFFFFFFFFFFC0ULL) | ((nlines - 1) & 0xF);
+    uint64_t x31_val = stride & 0xFFFFFFFFFFC0ULL;
+
+    __asm__ __volatile__(
+        "mv x31, %[x31]\n"
+        "csrw 0x8BF, %[val]\n"
+        :
+        : [x31] "r"(x31_val), [val] "r"(csr_val)
+        : "x31", "memory");
+}
+
+// Flushes an arbitrary line count by issuing multiple flush_to_l2 calls (works around its 16-line cap).
+static inline void __attribute__((always_inline)) flush_to_l2_multi(const void * addr, uint64_t nlines, uint64_t stride) {
+    const char * p = (const char *) addr;
+    while (nlines > 16) {
+        flush_to_l2(p, 16, stride);
+        p += 16 * stride;
+        nlines -= 16;
+    }
+    if (nlines) {
+        flush_to_l2(p, nlines, stride);
+    }
+}
+
+// Evicts nlines (max 16) cache lines from L1 via EvictVA; subsequent loads miss to L2/SCP. FENCE before, WAIT_CACHEOPS after.
+static inline void __attribute__((always_inline)) evict_to_l2(const void * addr, uint64_t nlines, uint64_t stride) {
+    uint64_t csr_val = (0x1ULL << 58) | ((uint64_t) addr & 0xFFFFFFFFFFC0ULL) | ((nlines - 1) & 0xF);
+    uint64_t x31_val = stride & 0xFFFFFFFFFFC0ULL;
+
+    __asm__ __volatile__(
+        "mv x31, %[x31]\n"
+        "csrw 0x89F, %[val]\n"
+        :
+        : [x31] "r"(x31_val), [val] "r"(csr_val)
+        : "x31", "memory");
+}
+
+// Signal a counter value to the other hart via L2 SCP.
+static inline void __attribute__((always_inline))
+scp_signal(volatile uint32_t *flag, uint32_t value) {
+    FENCE;
+    *flag = value;
+    FENCE;
+    evict_to_l2((const void *)flag, 1, 64);
+    WAIT_CACHEOPS;
+    FENCE;
+}
+
+// Wait for a counter in L2 SCP to reach the expected value.
+static inline void __attribute__((always_inline))
+scp_wait(volatile uint32_t *flag, uint32_t expected) {
+    while (1) {
+        evict_to_l2((const void *)flag, 1, 64);
+        WAIT_CACHEOPS;
+        FENCE;
+        if (*flag >= expected) {
+            FENCE;
+            return;
+        }
+    }
 }
 
 #endif // PLATFORM_H
