@@ -124,30 +124,28 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
                 for (int64_t m = hart_id; m < M; m += stride_m) {
                     // src0 is Q8_0 blocks, row pointer moves by nb01
                     const block_q8_0* q_row = (const block_q8_0*)(src0_ptr2 + m * nb01);
-                    float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
+                    float sum0, sum1, sum2, sum3;
 
                     // Set the vector mask ONCE for this row's whole K_blocks
                     // loop instead of paying a save/set/restore CSR sequence
                     // on every 32-element block call -- see
-                    // compute_block_dot_product_q8_0_masked_x4 in
-                    // block_ops.h. Mask CSR state is untouched by anything
-                    // else between these two asm blocks, so this is value-
-                    // identical to the per-call save/set/restore it replaces.
+                    // compute_row_dot_product_q8_0_masked_x4 in block_ops.h.
+                    // Mask CSR state is untouched by anything else between
+                    // these two asm blocks, so this is value-identical to
+                    // the per-call save/set/restore it replaces.
                     unsigned long saved_mask;
                     __asm__ volatile("mova.x.m %0" : "=r"(saved_mask));
                     __asm__ volatile("mov.m.x m0, x0, 0xFF");
 
-                    for (int64_t kb = 0; kb < K_blocks; kb++) {
-                        // q_row is a pointer to blocks, so + kb moves by sizeof(block_q8_0)
-                        // b_col is float*, so we move 32 elements (kb << 5)
-                        float p0, p1, p2, p3;
-                        compute_block_dot_product_q8_0_masked_x4(
-                            q_row + kb,
-                            b0_col_base + (kb << 5), b1_col_base + (kb << 5),
-                            b2_col_base + (kb << 5), b3_col_base + (kb << 5),
-                            &p0, &p1, &p2, &p3);
-                        sum0 += p0; sum1 += p1; sum2 += p2; sum3 += p3;
-                    }
+                    // Whole-row call: was one compute_block_dot_product_q8_0_
+                    // masked_x4 call per K-block (each paying its own 4-column
+                    // horizontal reduce), now one call that reduces each
+                    // column exactly once for the entire row -- see the
+                    // comment on compute_row_dot_product_q8_0_masked_x4.
+                    compute_row_dot_product_q8_0_masked_x4(
+                        q_row, K_blocks,
+                        b0_col_base, b1_col_base, b2_col_base, b3_col_base,
+                        &sum0, &sum1, &sum2, &sum3);
 
                     __asm__ volatile("mova.m.x %0" :: "r"(saved_mask));
 

@@ -248,6 +248,193 @@ static inline void compute_block_dot_product_q8_0_masked_x4(
     *out3 = s3 * scale;
 }
 
+// Whole-ROW counterpart to compute_block_dot_product_q8_0_masked_x4: computes
+// all K_blocks of a row's dot product against 4 activation columns with a
+// SINGLE horizontal reduce per column at the end, instead of one reduce per
+// block. Same caller contract (mask already set to 0xFF).
+//
+// Why this matters: compute_block_dot_product_q8_0_masked_x4 pays a full
+// swizzle/add/swizzle/add/move/broadcast/add reduce sequence (7 instructions)
+// FOUR TIMES -- once per column -- on every single 32-element block, even
+// though the row-level caller immediately throws that reduce away into a
+// plain scalar accumulator (see mul_mat_Q8_0.c's `sum0 += p0` loop). For a
+// K_blocks-block row that is 28*K_blocks reduce instructions where 28 would
+// do: the accumulate-then-reduce-once identity holds because addition
+// commutes/associates across blocks, so
+//   sum_over_blocks( reduce8(scale_b * chunk_b) )
+//     == reduce8( sum_over_blocks(scale_b * chunk_b) )
+// -- summing 4 independent 8-lane vector accumulators across all blocks and
+// reducing each ONCE at the end is value-identical to reducing every block
+// and summing the scalars, just without repeating the reduce K_blocks-1
+// extra times per column. Per-block per-lane accumulation order is
+// unchanged, so this differs from the block-reduce path only in f32
+// rounding order across the *reduce* step, not in which terms are summed.
+//
+// The whole K loop lives in ONE asm block (same reason as the per-block
+// helper above: separate asm statements would let the compiler treat the
+// accumulators as clobbered between them). Per-block fp16 scales are
+// pre-converted into a stack array ahead of the loop -- the ISA has no way
+// to call fp16_to_fp32 (ordinary C) from inside a live asm block without
+// spilling the persistent accumulators, so the conversion has to happen
+// before entry, exactly like it already does once per call in the per-block
+// helper, just amortized over the whole row instead of repeated per call.
+#define Q8_ROW_MAX_KBLOCKS 128  // K <= 4096; SmolVLM2's largest GEMM K is well under this
+static inline void compute_row_dot_product_q8_0_masked_x4(
+        const block_q8_0* q_row, int64_t K_blocks,
+        const float* b0_col_base, const float* b1_col_base,
+        const float* b2_col_base, const float* b3_col_base,
+        float* out0, float* out1, float* out2, float* out3) {
+
+    if (K_blocks > Q8_ROW_MAX_KBLOCKS) {
+        // Never reached by any current SmolVLM2 GEMM shape; keeps this
+        // function total instead of silently truncating a future larger K.
+        float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+        for (int64_t kb = 0; kb < K_blocks; kb++) {
+            float p0, p1, p2, p3;
+            compute_block_dot_product_q8_0_masked_x4(
+                q_row + kb,
+                b0_col_base + (kb << 5), b1_col_base + (kb << 5),
+                b2_col_base + (kb << 5), b3_col_base + (kb << 5),
+                &p0, &p1, &p2, &p3);
+            s0 += p0; s1 += p1; s2 += p2; s3 += p3;
+        }
+        *out0 = s0; *out1 = s1; *out2 = s2; *out3 = s3;
+        return;
+    }
+
+    float scales[Q8_ROW_MAX_KBLOCKS];
+    for (int64_t kb = 0; kb < K_blocks; kb++) {
+        scales[kb] = fp16_to_fp32(q_row[kb].d);
+    }
+
+    static const int32_t gather_pattern[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+
+    float s0, s1, s2, s3;
+    __asm__ __volatile__(
+        "flw.ps  f31, %[gather]\n\t"        // gather byte offsets {0..7}, hoisted
+        "fbci.pi f10, 0\n\t"                // persistent accumulator, column 0
+        "fbci.pi f13, 0\n\t"                // persistent accumulator, column 1
+        "fbci.pi f16, 0\n\t"                // persistent accumulator, column 2
+        "fbci.pi f19, 0\n\t"                // persistent accumulator, column 3
+        "mv   t0, %[qs]\n\t"                // t0 = &q_row[0].qs[0], stride 34B/block
+        "mv   t1, %[b0]\n\t"
+        "mv   t2, %[b1]\n\t"
+        "mv   t3, %[b2]\n\t"
+        "mv   t4, %[b3]\n\t"
+        "mv   t5, %[sc]\n\t"                // t5 = scales[0], stride 4B/block
+        "mv   t6, %[kb]\n\t"
+        "beqz t6, 2f\n\t"
+        "1:\n\t"
+        "lw       a0, 0(t5)\n\t"            // this block's pre-converted f32 scale
+        "fbcx.ps  f20, a0\n\t"              // broadcast it to all 8 lanes
+        "fbci.pi  f21, 0\n\t"               // per-block temp, column 0
+        "fbci.pi  f22, 0\n\t"               // per-block temp, column 1
+        "fbci.pi  f23, 0\n\t"               // per-block temp, column 2
+        "fbci.pi  f24, 0\n\t"               // per-block temp, column 3
+        // chunk 0 (weight bytes 0-7)
+        "fgb.ps   f11, f31(t0)\n\t"
+        "fcvt.ps.pw f11, f11\n\t"
+        "flw.ps   f12, 0(t1)\n\t"
+        "fmadd.ps f21, f11, f12, f21\n\t"
+        "flw.ps   f12, 0(t2)\n\t"
+        "fmadd.ps f22, f11, f12, f22\n\t"
+        "flw.ps   f12, 0(t3)\n\t"
+        "fmadd.ps f23, f11, f12, f23\n\t"
+        "flw.ps   f12, 0(t4)\n\t"
+        "fmadd.ps f24, f11, f12, f24\n\t"
+        // chunk 1 (weight bytes 8-15)
+        "addi     a1, t0, 8\n\t"
+        "fgb.ps   f11, f31(a1)\n\t"
+        "fcvt.ps.pw f11, f11\n\t"
+        "flw.ps   f12, 32(t1)\n\t"
+        "fmadd.ps f21, f11, f12, f21\n\t"
+        "flw.ps   f12, 32(t2)\n\t"
+        "fmadd.ps f22, f11, f12, f22\n\t"
+        "flw.ps   f12, 32(t3)\n\t"
+        "fmadd.ps f23, f11, f12, f23\n\t"
+        "flw.ps   f12, 32(t4)\n\t"
+        "fmadd.ps f24, f11, f12, f24\n\t"
+        // chunk 2 (weight bytes 16-23)
+        "addi     a1, t0, 16\n\t"
+        "fgb.ps   f11, f31(a1)\n\t"
+        "fcvt.ps.pw f11, f11\n\t"
+        "flw.ps   f12, 64(t1)\n\t"
+        "fmadd.ps f21, f11, f12, f21\n\t"
+        "flw.ps   f12, 64(t2)\n\t"
+        "fmadd.ps f22, f11, f12, f22\n\t"
+        "flw.ps   f12, 64(t3)\n\t"
+        "fmadd.ps f23, f11, f12, f23\n\t"
+        "flw.ps   f12, 64(t4)\n\t"
+        "fmadd.ps f24, f11, f12, f24\n\t"
+        // chunk 3 (weight bytes 24-31)
+        "addi     a1, t0, 24\n\t"
+        "fgb.ps   f11, f31(a1)\n\t"
+        "fcvt.ps.pw f11, f11\n\t"
+        "flw.ps   f12, 96(t1)\n\t"
+        "fmadd.ps f21, f11, f12, f21\n\t"
+        "flw.ps   f12, 96(t2)\n\t"
+        "fmadd.ps f22, f11, f12, f22\n\t"
+        "flw.ps   f12, 96(t3)\n\t"
+        "fmadd.ps f23, f11, f12, f23\n\t"
+        "flw.ps   f12, 96(t4)\n\t"
+        "fmadd.ps f24, f11, f12, f24\n\t"
+        // fold this block's scale into the four persistent accumulators
+        "fmadd.ps f10, f21, f20, f10\n\t"
+        "fmadd.ps f13, f22, f20, f13\n\t"
+        "fmadd.ps f16, f23, f20, f16\n\t"
+        "fmadd.ps f19, f24, f20, f19\n\t"
+        "addi t0, t0, 34\n\t"                // next block: sizeof(block_q8_0)
+        "addi t1, t1, 128\n\t"               // next 32 floats
+        "addi t2, t2, 128\n\t"
+        "addi t3, t3, 128\n\t"
+        "addi t4, t4, 128\n\t"
+        "addi t5, t5, 4\n\t"                 // next scale
+        "addi t6, t6, -1\n\t"
+        "bnez t6, 1b\n\t"
+        "2:\n\t"
+        // ONE horizontal reduce per column (hoisted out of the block loop)
+        "fswizz.ps f1, f10, 0xB1\n\t"
+        "fadd.ps   f2, f10, f1, rne\n\t"
+        "fswizz.ps f3, f2, 0x4E\n\t"
+        "fadd.ps   f4, f2, f3, rne\n\t"
+        "fmvz.x.ps a0, f4, 4\n\t"
+        "fbcx.ps   f5, a0\n\t"
+        "fadd.ps   %[o0], f4, f5, rne\n\t"
+        "fswizz.ps f1, f13, 0xB1\n\t"
+        "fadd.ps   f2, f13, f1, rne\n\t"
+        "fswizz.ps f3, f2, 0x4E\n\t"
+        "fadd.ps   f4, f2, f3, rne\n\t"
+        "fmvz.x.ps a0, f4, 4\n\t"
+        "fbcx.ps   f5, a0\n\t"
+        "fadd.ps   %[o1], f4, f5, rne\n\t"
+        "fswizz.ps f1, f16, 0xB1\n\t"
+        "fadd.ps   f2, f16, f1, rne\n\t"
+        "fswizz.ps f3, f2, 0x4E\n\t"
+        "fadd.ps   f4, f2, f3, rne\n\t"
+        "fmvz.x.ps a0, f4, 4\n\t"
+        "fbcx.ps   f5, a0\n\t"
+        "fadd.ps   %[o2], f4, f5, rne\n\t"
+        "fswizz.ps f1, f19, 0xB1\n\t"
+        "fadd.ps   f2, f19, f1, rne\n\t"
+        "fswizz.ps f3, f2, 0x4E\n\t"
+        "fadd.ps   f4, f2, f3, rne\n\t"
+        "fmvz.x.ps a0, f4, 4\n\t"
+        "fbcx.ps   f5, a0\n\t"
+        "fadd.ps   %[o3], f4, f5, rne\n\t"
+        : [o0] "=f"(s0), [o1] "=f"(s1), [o2] "=f"(s2), [o3] "=f"(s3)
+        : [gather] "m"(*(const int32_t(*)[8])gather_pattern),
+          [qs] "r"(q_row->qs),
+          [b0] "r"(b0_col_base), [b1] "r"(b1_col_base),
+          [b2] "r"(b2_col_base), [b3] "r"(b3_col_base),
+          [sc] "r"(scales), [kb] "r"(K_blocks)
+        : "t0", "t1", "t2", "t3", "t4", "t5", "t6", "a0", "a1", "memory",
+          "f1", "f2", "f3", "f4", "f5", "f10", "f11", "f12", "f13", "f16",
+          "f19", "f20", "f21", "f22", "f23", "f24", "f31"
+    );
+
+    *out0 = s0; *out1 = s1; *out2 = s2; *out3 = s3;
+}
+
 
 // Compute dot product between f16 block and f32 column vector (NAIVE VERSION)
 // Scalar implementation for debugging - no vectorization
