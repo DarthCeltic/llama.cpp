@@ -435,6 +435,280 @@ static inline void compute_row_dot_product_q8_0_masked_x4(
     *out0 = s0; *out1 = s1; *out2 = s2; *out3 = s3;
 }
 
+// N=8 counterpart to compute_row_dot_product_q8_0_masked_x4: same whole-row,
+// hoisted-single-reduce structure, but against EIGHT activation columns
+// instead of four. Each block's weight gather+convert (fgb.ps/fcvt.ps.pw) is
+// issued ONCE per chunk and feeds eight independent fmadd chains, so the
+// weight-side memory/conversion traffic that dominates this memory-bound
+// kernel is amortized 8-fold instead of 4-fold whenever N >= 8 columns are
+// available together (SmolVLM2's vision-encoder GEMMs process many patches
+// at once, so N is comfortably >= 8 there). Falls back to the N=4 path,
+// and that falls back further to N=1, for any remainder columns -- see the
+// N & ~7 / N & ~3 tiling in mul_mat_Q8_0.c.
+//
+// Register map for the one persistent asm block (K loop entirely inside,
+// same reason as the N=4 version: separate asm statements would let the
+// compiler treat the accumulators as clobbered between them): accumulators
+// f10/f13/f16/f19/f22/f25/f28/f6 (columns 0-7); per-block temps f7/f8/f9/
+// f14/f15/f17/f18/f21 (columns 0-7); f11 = gathered+converted weight chunk;
+// f12 = activation chunk load; f20 = broadcast block scale; f31 = gather
+// pattern; f1-f5 = reduce scratch (reused sequentially per column, safe
+// since no two column reduces overlap). t0 = weight qs ptr, t1-t6/a2-a3 =
+// eight activation column ptrs, a4 = scale ptr, a5 = block counter, a0/a1
+// = scratch (chunk-offset calc, scale load).
+static inline void compute_row_dot_product_q8_0_masked_x8(
+        const block_q8_0* q_row, int64_t K_blocks,
+        const float* b0, const float* b1, const float* b2, const float* b3,
+        const float* b4, const float* b5, const float* b6, const float* b7,
+        float* out0, float* out1, float* out2, float* out3,
+        float* out4, float* out5, float* out6, float* out7) {
+
+    if (K_blocks > Q8_ROW_MAX_KBLOCKS) {
+        // Never reached by any current SmolVLM2 GEMM shape; keeps this
+        // function total instead of silently truncating a future larger K.
+        float p0[4], p1[4];
+        float s[8] = {0};
+        const float* cols[8] = {b0, b1, b2, b3, b4, b5, b6, b7};
+        for (int64_t kb = 0; kb < K_blocks; kb++) {
+            compute_block_dot_product_q8_0_masked_x4(
+                q_row + kb, cols[0] + (kb << 5), cols[1] + (kb << 5),
+                cols[2] + (kb << 5), cols[3] + (kb << 5),
+                &p0[0], &p0[1], &p0[2], &p0[3]);
+            compute_block_dot_product_q8_0_masked_x4(
+                q_row + kb, cols[4] + (kb << 5), cols[5] + (kb << 5),
+                cols[6] + (kb << 5), cols[7] + (kb << 5),
+                &p1[0], &p1[1], &p1[2], &p1[3]);
+            s[0]+=p0[0]; s[1]+=p0[1]; s[2]+=p0[2]; s[3]+=p0[3];
+            s[4]+=p1[0]; s[5]+=p1[1]; s[6]+=p1[2]; s[7]+=p1[3];
+        }
+        *out0=s[0]; *out1=s[1]; *out2=s[2]; *out3=s[3];
+        *out4=s[4]; *out5=s[5]; *out6=s[6]; *out7=s[7];
+        return;
+    }
+
+    float scales[Q8_ROW_MAX_KBLOCKS];
+    for (int64_t kb = 0; kb < K_blocks; kb++) {
+        scales[kb] = fp16_to_fp32(q_row[kb].d);
+    }
+
+    static const int32_t gather_pattern[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+
+    float s0, s1, s2, s3, s4, s5, s6, s7;
+    __asm__ __volatile__(
+        "flw.ps  f31, %[gather]\n\t"
+        "fbci.pi f10, 0\n\t"
+        "fbci.pi f13, 0\n\t"
+        "fbci.pi f16, 0\n\t"
+        "fbci.pi f19, 0\n\t"
+        "fbci.pi f22, 0\n\t"
+        "fbci.pi f25, 0\n\t"
+        "fbci.pi f28, 0\n\t"
+        "fbci.pi f6,  0\n\t"
+        "mv   t0, %[qs]\n\t"
+        "mv   t1, %[b0]\n\t"
+        "mv   t2, %[b1]\n\t"
+        "mv   t3, %[b2]\n\t"
+        "mv   t4, %[b3]\n\t"
+        "mv   t5, %[b4]\n\t"
+        "mv   t6, %[b5]\n\t"
+        "mv   a2, %[b6]\n\t"
+        "mv   a3, %[b7]\n\t"
+        "mv   a4, %[sc]\n\t"
+        "mv   a5, %[kb]\n\t"
+        "beqz a5, 2f\n\t"
+        "1:\n\t"
+        "lw       a0, 0(a4)\n\t"
+        "fbcx.ps  f20, a0\n\t"
+        "fbci.pi  f7,  0\n\t"
+        "fbci.pi  f8,  0\n\t"
+        "fbci.pi  f9,  0\n\t"
+        "fbci.pi  f14, 0\n\t"
+        "fbci.pi  f15, 0\n\t"
+        "fbci.pi  f17, 0\n\t"
+        "fbci.pi  f18, 0\n\t"
+        "fbci.pi  f21, 0\n\t"
+        // chunk 0 (weight bytes 0-7)
+        "fgb.ps   f11, f31(t0)\n\t"
+        "fcvt.ps.pw f11, f11\n\t"
+        "flw.ps   f12, 0(t1)\n\t"
+        "fmadd.ps f7,  f11, f12, f7\n\t"
+        "flw.ps   f12, 0(t2)\n\t"
+        "fmadd.ps f8,  f11, f12, f8\n\t"
+        "flw.ps   f12, 0(t3)\n\t"
+        "fmadd.ps f9,  f11, f12, f9\n\t"
+        "flw.ps   f12, 0(t4)\n\t"
+        "fmadd.ps f14, f11, f12, f14\n\t"
+        "flw.ps   f12, 0(t5)\n\t"
+        "fmadd.ps f15, f11, f12, f15\n\t"
+        "flw.ps   f12, 0(t6)\n\t"
+        "fmadd.ps f17, f11, f12, f17\n\t"
+        "flw.ps   f12, 0(a2)\n\t"
+        "fmadd.ps f18, f11, f12, f18\n\t"
+        "flw.ps   f12, 0(a3)\n\t"
+        "fmadd.ps f21, f11, f12, f21\n\t"
+        // chunk 1 (weight bytes 8-15)
+        "addi     a1, t0, 8\n\t"
+        "fgb.ps   f11, f31(a1)\n\t"
+        "fcvt.ps.pw f11, f11\n\t"
+        "flw.ps   f12, 32(t1)\n\t"
+        "fmadd.ps f7,  f11, f12, f7\n\t"
+        "flw.ps   f12, 32(t2)\n\t"
+        "fmadd.ps f8,  f11, f12, f8\n\t"
+        "flw.ps   f12, 32(t3)\n\t"
+        "fmadd.ps f9,  f11, f12, f9\n\t"
+        "flw.ps   f12, 32(t4)\n\t"
+        "fmadd.ps f14, f11, f12, f14\n\t"
+        "flw.ps   f12, 32(t5)\n\t"
+        "fmadd.ps f15, f11, f12, f15\n\t"
+        "flw.ps   f12, 32(t6)\n\t"
+        "fmadd.ps f17, f11, f12, f17\n\t"
+        "flw.ps   f12, 32(a2)\n\t"
+        "fmadd.ps f18, f11, f12, f18\n\t"
+        "flw.ps   f12, 32(a3)\n\t"
+        "fmadd.ps f21, f11, f12, f21\n\t"
+        // chunk 2 (weight bytes 16-23)
+        "addi     a1, t0, 16\n\t"
+        "fgb.ps   f11, f31(a1)\n\t"
+        "fcvt.ps.pw f11, f11\n\t"
+        "flw.ps   f12, 64(t1)\n\t"
+        "fmadd.ps f7,  f11, f12, f7\n\t"
+        "flw.ps   f12, 64(t2)\n\t"
+        "fmadd.ps f8,  f11, f12, f8\n\t"
+        "flw.ps   f12, 64(t3)\n\t"
+        "fmadd.ps f9,  f11, f12, f9\n\t"
+        "flw.ps   f12, 64(t4)\n\t"
+        "fmadd.ps f14, f11, f12, f14\n\t"
+        "flw.ps   f12, 64(t5)\n\t"
+        "fmadd.ps f15, f11, f12, f15\n\t"
+        "flw.ps   f12, 64(t6)\n\t"
+        "fmadd.ps f17, f11, f12, f17\n\t"
+        "flw.ps   f12, 64(a2)\n\t"
+        "fmadd.ps f18, f11, f12, f18\n\t"
+        "flw.ps   f12, 64(a3)\n\t"
+        "fmadd.ps f21, f11, f12, f21\n\t"
+        // chunk 3 (weight bytes 24-31)
+        "addi     a1, t0, 24\n\t"
+        "fgb.ps   f11, f31(a1)\n\t"
+        "fcvt.ps.pw f11, f11\n\t"
+        "flw.ps   f12, 96(t1)\n\t"
+        "fmadd.ps f7,  f11, f12, f7\n\t"
+        "flw.ps   f12, 96(t2)\n\t"
+        "fmadd.ps f8,  f11, f12, f8\n\t"
+        "flw.ps   f12, 96(t3)\n\t"
+        "fmadd.ps f9,  f11, f12, f9\n\t"
+        "flw.ps   f12, 96(t4)\n\t"
+        "fmadd.ps f14, f11, f12, f14\n\t"
+        "flw.ps   f12, 96(t5)\n\t"
+        "fmadd.ps f15, f11, f12, f15\n\t"
+        "flw.ps   f12, 96(t6)\n\t"
+        "fmadd.ps f17, f11, f12, f17\n\t"
+        "flw.ps   f12, 96(a2)\n\t"
+        "fmadd.ps f18, f11, f12, f18\n\t"
+        "flw.ps   f12, 96(a3)\n\t"
+        "fmadd.ps f21, f11, f12, f21\n\t"
+        // fold this block's scale into the eight persistent accumulators
+        "fmadd.ps f10, f7,  f20, f10\n\t"
+        "fmadd.ps f13, f8,  f20, f13\n\t"
+        "fmadd.ps f16, f9,  f20, f16\n\t"
+        "fmadd.ps f19, f14, f20, f19\n\t"
+        "fmadd.ps f22, f15, f20, f22\n\t"
+        "fmadd.ps f25, f17, f20, f25\n\t"
+        "fmadd.ps f28, f18, f20, f28\n\t"
+        "fmadd.ps f6,  f21, f20, f6\n\t"
+        "addi t0, t0, 34\n\t"
+        "addi t1, t1, 128\n\t"
+        "addi t2, t2, 128\n\t"
+        "addi t3, t3, 128\n\t"
+        "addi t4, t4, 128\n\t"
+        "addi t5, t5, 128\n\t"
+        "addi t6, t6, 128\n\t"
+        "addi a2, a2, 128\n\t"
+        "addi a3, a3, 128\n\t"
+        "addi a4, a4, 4\n\t"
+        "addi a5, a5, -1\n\t"
+        "bnez a5, 1b\n\t"
+        "2:\n\t"
+        // one horizontal reduce per column (hoisted out of the block loop)
+        "fswizz.ps f1, f10, 0xB1\n\t"
+        "fadd.ps   f2, f10, f1, rne\n\t"
+        "fswizz.ps f3, f2, 0x4E\n\t"
+        "fadd.ps   f4, f2, f3, rne\n\t"
+        "fmvz.x.ps a0, f4, 4\n\t"
+        "fbcx.ps   f1, a0\n\t"
+        "fadd.ps   %[o0], f4, f1, rne\n\t"
+        "fswizz.ps f1, f13, 0xB1\n\t"
+        "fadd.ps   f2, f13, f1, rne\n\t"
+        "fswizz.ps f3, f2, 0x4E\n\t"
+        "fadd.ps   f4, f2, f3, rne\n\t"
+        "fmvz.x.ps a0, f4, 4\n\t"
+        "fbcx.ps   f1, a0\n\t"
+        "fadd.ps   %[o1], f4, f1, rne\n\t"
+        "fswizz.ps f1, f16, 0xB1\n\t"
+        "fadd.ps   f2, f16, f1, rne\n\t"
+        "fswizz.ps f3, f2, 0x4E\n\t"
+        "fadd.ps   f4, f2, f3, rne\n\t"
+        "fmvz.x.ps a0, f4, 4\n\t"
+        "fbcx.ps   f1, a0\n\t"
+        "fadd.ps   %[o2], f4, f1, rne\n\t"
+        "fswizz.ps f1, f19, 0xB1\n\t"
+        "fadd.ps   f2, f19, f1, rne\n\t"
+        "fswizz.ps f3, f2, 0x4E\n\t"
+        "fadd.ps   f4, f2, f3, rne\n\t"
+        "fmvz.x.ps a0, f4, 4\n\t"
+        "fbcx.ps   f1, a0\n\t"
+        "fadd.ps   %[o3], f4, f1, rne\n\t"
+        "fswizz.ps f1, f22, 0xB1\n\t"
+        "fadd.ps   f2, f22, f1, rne\n\t"
+        "fswizz.ps f3, f2, 0x4E\n\t"
+        "fadd.ps   f4, f2, f3, rne\n\t"
+        "fmvz.x.ps a0, f4, 4\n\t"
+        "fbcx.ps   f1, a0\n\t"
+        "fadd.ps   %[o4], f4, f1, rne\n\t"
+        "fswizz.ps f1, f25, 0xB1\n\t"
+        "fadd.ps   f2, f25, f1, rne\n\t"
+        "fswizz.ps f3, f2, 0x4E\n\t"
+        "fadd.ps   f4, f2, f3, rne\n\t"
+        "fmvz.x.ps a0, f4, 4\n\t"
+        "fbcx.ps   f1, a0\n\t"
+        "fadd.ps   %[o5], f4, f1, rne\n\t"
+        "fswizz.ps f1, f28, 0xB1\n\t"
+        "fadd.ps   f2, f28, f1, rne\n\t"
+        "fswizz.ps f3, f2, 0x4E\n\t"
+        "fadd.ps   f4, f2, f3, rne\n\t"
+        "fmvz.x.ps a0, f4, 4\n\t"
+        "fbcx.ps   f1, a0\n\t"
+        "fadd.ps   %[o6], f4, f1, rne\n\t"
+        "fswizz.ps f1, f6, 0xB1\n\t"
+        "fadd.ps   f2, f6, f1, rne\n\t"
+        "fswizz.ps f3, f2, 0x4E\n\t"
+        "fadd.ps   f4, f2, f3, rne\n\t"
+        "fmvz.x.ps a0, f4, 4\n\t"
+        "fbcx.ps   f1, a0\n\t"
+        "fadd.ps   %[o7], f4, f1, rne\n\t"
+        : [o0] "=f"(s0), [o1] "=f"(s1), [o2] "=f"(s2), [o3] "=f"(s3),
+          [o4] "=f"(s4), [o5] "=f"(s5), [o6] "=f"(s6), [o7] "=f"(s7)
+        : [gather] "m"(*(const int32_t(*)[8])gather_pattern),
+          [qs] "r"(q_row->qs),
+          [b0] "r"(b0), [b1] "r"(b1), [b2] "r"(b2), [b3] "r"(b3),
+          [b4] "r"(b4), [b5] "r"(b5), [b6] "r"(b6), [b7] "r"(b7),
+          [sc] "r"(scales), [kb] "r"(K_blocks)
+        : "t0", "t1", "t2", "t3", "t4", "t5", "t6", "a0", "a1", "a2", "a3",
+          "a4", "a5", "memory",
+          "f1", "f2", "f3", "f4", "f6", "f7", "f8", "f9",
+          "f10", "f11", "f12", "f13", "f14", "f15", "f16", "f17", "f18",
+          "f19", "f20", "f21", "f22", "f25", "f28", "f31"
+          // f5 deliberately NOT clobbered -- reused as scratch above instead
+          // of a dedicated register, to leave exactly 8 free f-registers
+          // (f0,f5,f23,f24,f26,f27,f29,f30) for the 8 "=f" output operands.
+          // With f5 also clobbered there were only 7 free, one short of the
+          // 8 outputs needed -- "impossible constraints" from the real
+          // compiler, caught live 2026-07-20 trying to compile this.
+    );
+
+    *out0 = s0; *out1 = s1; *out2 = s2; *out3 = s3;
+    *out4 = s4; *out5 = s5; *out6 = s6; *out7 = s7;
+}
+
 
 // Compute dot product between f16 block and f32 column vector (NAIVE VERSION)
 // Scalar implementation for debugging - no vectorization
