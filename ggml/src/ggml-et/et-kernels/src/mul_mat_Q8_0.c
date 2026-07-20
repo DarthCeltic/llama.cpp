@@ -126,38 +126,99 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
                 const float* b6_col_base = (const float*)(src1_ptr2 + (n + 6) * nb11);
                 const float* b7_col_base = (const float*)(src1_ptr2 + (n + 7) * nb11);
 
-                for (int64_t m = hart_id; m < M; m += stride_m) {
-                    const block_q8_0* q_row = (const block_q8_0*)(src0_ptr2 + m * nb01);
-                    float sum0, sum1, sum2, sum3, sum4, sum5, sum6, sum7;
+                float* d0 = (float*)(dst_ptr2 + (n + 0) * nbd1);
+                float* d1 = (float*)(dst_ptr2 + (n + 1) * nbd1);
+                float* d2 = (float*)(dst_ptr2 + (n + 2) * nbd1);
+                float* d3 = (float*)(dst_ptr2 + (n + 3) * nbd1);
+                float* d4 = (float*)(dst_ptr2 + (n + 4) * nbd1);
+                float* d5 = (float*)(dst_ptr2 + (n + 5) * nbd1);
+                float* d6 = (float*)(dst_ptr2 + (n + 6) * nbd1);
+                float* d7 = (float*)(dst_ptr2 + (n + 7) * nbd1);
 
-                    unsigned long saved_mask;
-                    __asm__ volatile("mova.x.m %0" : "=r"(saved_mask));
-                    __asm__ volatile("mov.m.x m0, x0, 0xFF");
+                // Cache-line-owned tile store: on this non-coherent target,
+                // atomic_store_f32 (amoswapg.w) exists ONLY because harts are
+                // striped one-row-per-hart across m, so adjacent m's from
+                // DIFFERENT harts share a 64B/16-float dst cache line -- see
+                // set_rows_f32.c's "Parallelization strategy" note (same
+                // established two-tier pattern reused here, not new
+                // hardware-behavior guesswork). If every one of this tile's
+                // 8 column bases is itself cache-line aligned, giving each
+                // hart a whole CACHE_LINE_TILE-row chunk means it owns those
+                // cache lines exclusively (m0 is always a CACHE_LINE_TILE
+                // multiple, and nothing beyond M exists to race a partial
+                // tail tile), so a plain store is safe and skips the
+                // amoswapg.w global-bypass cost entirely for that tile.
+                // Unaligned columns fall back to the exact original
+                // striped/atomic path below -- correctness never depends on
+                // this branch.
+                const uintptr_t align_probe = (uintptr_t)d0 | (uintptr_t)d1 | (uintptr_t)d2 |
+                    (uintptr_t)d3 | (uintptr_t)d4 | (uintptr_t)d5 | (uintptr_t)d6 | (uintptr_t)d7;
+                const int cache_line_aligned = (align_probe & (uintptr_t)63) == 0;
 
-                    compute_row_dot_product_q8_0_masked_x8(
-                        q_row, K_blocks,
-                        b0_col_base, b1_col_base, b2_col_base, b3_col_base,
-                        b4_col_base, b5_col_base, b6_col_base, b7_col_base,
-                        &sum0, &sum1, &sum2, &sum3, &sum4, &sum5, &sum6, &sum7);
+                if (cache_line_aligned) {
+                    const int64_t CACHE_LINE_TILE = 16; // 64B / sizeof(float)
+                    for (int64_t m0 = hart_id * CACHE_LINE_TILE; m0 < M;
+                         m0 += stride_m * CACHE_LINE_TILE) {
+                        const int64_t tile_len =
+                            (m0 + CACHE_LINE_TILE <= M) ? CACHE_LINE_TILE : (M - m0);
+                        float buf0[16], buf1[16], buf2[16], buf3[16];
+                        float buf4[16], buf5[16], buf6[16], buf7[16];
 
-                    __asm__ volatile("mova.m.x %0" :: "r"(saved_mask));
+                        for (int64_t li = 0; li < tile_len; li++) {
+                            const block_q8_0* q_row =
+                                (const block_q8_0*)(src0_ptr2 + (m0 + li) * nb01);
 
-                    float* d0 = (float*)(dst_ptr2 + (n + 0) * nbd1 + m * sizeof(float));
-                    float* d1 = (float*)(dst_ptr2 + (n + 1) * nbd1 + m * sizeof(float));
-                    float* d2 = (float*)(dst_ptr2 + (n + 2) * nbd1 + m * sizeof(float));
-                    float* d3 = (float*)(dst_ptr2 + (n + 3) * nbd1 + m * sizeof(float));
-                    float* d4 = (float*)(dst_ptr2 + (n + 4) * nbd1 + m * sizeof(float));
-                    float* d5 = (float*)(dst_ptr2 + (n + 5) * nbd1 + m * sizeof(float));
-                    float* d6 = (float*)(dst_ptr2 + (n + 6) * nbd1 + m * sizeof(float));
-                    float* d7 = (float*)(dst_ptr2 + (n + 7) * nbd1 + m * sizeof(float));
-                    atomic_store_f32((volatile float*)d0, sum0);
-                    atomic_store_f32((volatile float*)d1, sum1);
-                    atomic_store_f32((volatile float*)d2, sum2);
-                    atomic_store_f32((volatile float*)d3, sum3);
-                    atomic_store_f32((volatile float*)d4, sum4);
-                    atomic_store_f32((volatile float*)d5, sum5);
-                    atomic_store_f32((volatile float*)d6, sum6);
-                    atomic_store_f32((volatile float*)d7, sum7);
+                            unsigned long saved_mask;
+                            __asm__ volatile("mova.x.m %0" : "=r"(saved_mask));
+                            __asm__ volatile("mov.m.x m0, x0, 0xFF");
+
+                            compute_row_dot_product_q8_0_masked_x8(
+                                q_row, K_blocks,
+                                b0_col_base, b1_col_base, b2_col_base, b3_col_base,
+                                b4_col_base, b5_col_base, b6_col_base, b7_col_base,
+                                &buf0[li], &buf1[li], &buf2[li], &buf3[li],
+                                &buf4[li], &buf5[li], &buf6[li], &buf7[li]);
+
+                            __asm__ volatile("mova.m.x %0" :: "r"(saved_mask));
+                        }
+
+                        for (int64_t li = 0; li < tile_len; li++) {
+                            d0[m0 + li] = buf0[li];
+                            d1[m0 + li] = buf1[li];
+                            d2[m0 + li] = buf2[li];
+                            d3[m0 + li] = buf3[li];
+                            d4[m0 + li] = buf4[li];
+                            d5[m0 + li] = buf5[li];
+                            d6[m0 + li] = buf6[li];
+                            d7[m0 + li] = buf7[li];
+                        }
+                    }
+                } else {
+                    for (int64_t m = hart_id; m < M; m += stride_m) {
+                        const block_q8_0* q_row = (const block_q8_0*)(src0_ptr2 + m * nb01);
+                        float sum0, sum1, sum2, sum3, sum4, sum5, sum6, sum7;
+
+                        unsigned long saved_mask;
+                        __asm__ volatile("mova.x.m %0" : "=r"(saved_mask));
+                        __asm__ volatile("mov.m.x m0, x0, 0xFF");
+
+                        compute_row_dot_product_q8_0_masked_x8(
+                            q_row, K_blocks,
+                            b0_col_base, b1_col_base, b2_col_base, b3_col_base,
+                            b4_col_base, b5_col_base, b6_col_base, b7_col_base,
+                            &sum0, &sum1, &sum2, &sum3, &sum4, &sum5, &sum6, &sum7);
+
+                        __asm__ volatile("mova.m.x %0" :: "r"(saved_mask));
+
+                        atomic_store_f32((volatile float*)&d0[m], sum0);
+                        atomic_store_f32((volatile float*)&d1[m], sum1);
+                        atomic_store_f32((volatile float*)&d2[m], sum2);
+                        atomic_store_f32((volatile float*)&d3[m], sum3);
+                        atomic_store_f32((volatile float*)&d4[m], sum4);
+                        atomic_store_f32((volatile float*)&d5[m], sum5);
+                        atomic_store_f32((volatile float*)&d6[m], sum6);
+                        atomic_store_f32((volatile float*)&d7[m], sum7);
+                    }
                 }
             }
 
