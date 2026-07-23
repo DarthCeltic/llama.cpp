@@ -2,45 +2,43 @@
 // MUL_MAT Kernel
 // Matrix multiplication: C[M,N] = A[M,K] * B[K,N]
 //
-// COMBO A -- structural base, unmodified.
+// COMBO C (v2, prefetch removed) -- a deliberately DIFFERENT lever
+// combination from Combo A/B, not a strict superset. Composes two
+// independently-proven techniques:
 //
-// Kernel body is RehanQasim-dev's Q8_0 matrix-engine GEMM design
-// (aifoundry-org/llama.cpp commit 84405bb7f86458c60c9f47a6a140f1c876da8532,
-// "et-backend: Q8_0 matrix-engine GEMM kernel for prefill"), rebuilt here
-// against the CURRENT shared main tip (f67c2b2a30a24bf9354857cde0f233620a20eb23)
-// -- his own commit had diverged from current main's block_ops.h/mul_mat_Q8_0.c,
-// so this is a from-source graft (his q8_dot_* API merged into current main's
-// block_ops.h), not a blind file copy. Used under Ryan Gurganious/DarthCeltic's
-// explicit account-owner authorization from RehanQasim-dev to build on his code
-// for this track (see corpus entry
-// hackathon_llama32_1b_ABI_COMPAT_and_THREE_COMBO_PLAN_20260723).
+//   1. Mask-hoist (q8_dot_begin/end, shared with Combo A/B / Rehan's design)
+//   2. Batched-8 fp16 scale-convert (THIS session's own standalone lever,
+//      already oracle-verified earlier and staged as PR#168's prior content
+//      -- packs 8 consecutive blocks' deltas into a scratch buffer and does
+//      ONE fgh.ps+fcvt.ps.f16 for all 8, instead of 8 separate
+//      fbcx.ps+fcvt.ps.f16 calls)
 //
-// This PR (#168) is the empirical control: does this structure alone, freshly
-// rebuilt, reproduce his ~14.7 tok/s? PR#169/#170 layer independently-built,
-// additive levers (light prefetch, batched scale-convert) on top of this same
-// base, so real board data -- not prediction -- shows what each addition is
-// actually worth.
+// v1 of this combo also included the light-prefetch lever, but that lever
+// was found to crash on a real full-model board run (undrained prefetch_va
+// CSR -- see Combo B v2's header for the full diagnosis). Rather than stack
+// an unconfirmed prefetch fix INTO this combo too, prefetch is isolated to
+// its own single-variable test on PR#169 (Combo B v2) and dropped entirely
+// here -- this combo now tests ONLY the batched-8 scale-convert lever in
+// isolation, on top of a base already proven clean on real hardware
+// (Combo A, no prefetch, no batched scale-convert).
 //
-// EXCLUDED ON PURPOSE: Rehan's K-split / K-split-group branches (both-harts-
-// share-a-row via an L2SCP exchange + semaphore barrier) called
-// et_sem_post/et_sem_wait, et_shire_l2scp_local, and a whole-tensor
-// evict_region_past_l2 helper -- NONE of these exist anywhere in current
-// shared main's platform.h (grepped the full et-kernels/src tree at
-// f67c2b2a30a24bf9354857cde0f233620a20eb23, confirmed absent). His fork added
-// that semaphore infrastructure itself; it never landed on the shared tip.
-// Hand-guessing a semaphore/barrier implementation with no reference to
-// verify against is not a risk worth taking on real hardware (silent
-// wrong-answer or hang). Checked the actual shape math for llama32_1b
-// (hidden=2048, intermediate=8192, vocab=128256): every Q8_0 matmul's
-// K_blocks is <=256 (TILE_KB), so the tile-outer and K-split-group branches
-// are dead code for this model's shapes anyway -- except the K-split "small
-// rows" carve-out, which specifically would help k_proj/v_proj at M=512
-// (1536 of 2048 harts otherwise idle under plain striping). That specific
-// gap is real and left as an open, flagged opportunity for anyone who can
-// source the real semaphore primitives -- not silently dropped. Tile-outer
-// is kept (uses only confirmed-available primitives) for robustness against
-// the OTHER 11 regression-check models, which may have larger K than this
-// track's target model.
+// NOT included here: Rehan's x2-row-batching and deferred-whole-row vector
+// accumulation (f20 persists across all blocks, reduced once at the end).
+// Investigated porting batched-8 scale-convert INTO that deferred-
+// accumulation design and found it requires extracting an arbitrary lane
+// (0..7) from a converted-scales vector register into a scalar for a
+// per-lane broadcast -- every lane-extract primitive actually observed in
+// this codebase (fmvz.x.ps) only pulls a FIXED lane (lane 4, after a
+// pairwise reduction has consolidated the vector), not an arbitrary index.
+// Inventing an 8-way arbitrary-lane extract with no reference to verify
+// against is exactly the kind of guess that produced this session's earlier
+// board-proven regression (cache-line-owned stores); not worth the risk.
+// Batched-8 scale-convert composes cleanly instead with a per-block scalar
+// reduction (this file), trading away x2-row B-load reuse for the batched
+// scale win -- a genuinely different, non-overlapping bet from Combo A/B,
+// so real board data (not prediction) shows which strategy is worth more
+// for THIS lever combination. See corpus entry
+// hackathon_llama32_1b_ABI_COMPAT_and_THREE_COMBO_PLAN_20260723.
 //
 // Verified via llama.cpp's own test-backend-ops oracle against the real ET
 // software-emulator backend before submission.
@@ -54,9 +52,82 @@
 
 #include <stdint.h>
 
-#define STRIDE_M       2048 /* 32 shires x 32 minions x 2 harts */
-#define TILE_KB        256  /* K-tile size in Q8_0 blocks (8192 elems, 32KB B data) */
-#define SIMPLE_X2_ROWS 2
+#define STRIDE_M 2048 /* 32 shires x 32 minions x 2 harts */
+#define TILE_KB  256  /* K-tile size in Q8_0 blocks (8192 elems, 32KB B data) */
+
+// Row dot product with batched-8 fp16 scale-unpack. Mask is assumed already
+// set to 0xFF by the caller's q8_dot_begin (mask-hoist happens ONCE per n,
+// not once per row/block) -- this function does not touch the mask register.
+static inline float compute_row_dot_q8_0_scaleunpack_nomask(const block_q8_0 * q_row,
+                                                             const float *      b_col_base,
+                                                             int64_t            K_blocks) {
+    static const int32_t gather_bytes[8] = { 0, 1, 2, 3, 4, 5, 6, 7 };
+    static const int32_t f16_pattern[8]  = { 0, 2, 4, 6, 8, 10, 12, 14 };
+
+    float         row_sum    = 0.0f;
+    const int64_t groups     = K_blocks / 8;
+    const int64_t tail_start = groups * 8;
+
+    for (int64_t g = 0; g < groups; g++) {
+        uint16_t deltas[8] __attribute__((aligned(16)));
+        for (int i = 0; i < 8; i++) {
+            deltas[i] = q_row[g * 8 + i].d;
+        }
+        float scales[8] __attribute__((aligned(32)));
+        __asm__ volatile(
+            "flw.ps      f21, %[pat]\n"
+            "fgh.ps      f20, f21(%[d])\n"
+            "fcvt.ps.f16 f20, f20\n"
+            "fsw.ps      f20, %[out]\n"
+            : [out] "=m"(*(float (*)[8]) scales)
+            : [d] "r"(deltas), [pat] "m"(*(const int32_t (*)[8]) f16_pattern)
+            : "f20", "f21");
+
+        for (int i = 0; i < 8; i++) {
+            const block_q8_0 * blk = q_row + g * 8 + i;
+            const float *      b   = b_col_base + ((int64_t) (g * 8 + i) << 5);
+
+            float acc;
+            __asm__ volatile(
+                "flw.ps     f31, %[gb]\n"
+                "fbci.pi    f10, 0\n"
+                "flw.ps     f12, 0(%[b])\n"
+                "fgb.ps     f11, f31(%[a])\n"
+                "fcvt.ps.pw f11, f11\n"
+                "fmadd.ps   f10, f11, f12, f10\n"
+                "flw.ps     f12, 32(%[b])\n"
+                "fgb.ps     f11, f31(%[a1])\n"
+                "fcvt.ps.pw f11, f11\n"
+                "fmadd.ps   f10, f11, f12, f10\n"
+                "flw.ps     f12, 64(%[b])\n"
+                "fgb.ps     f11, f31(%[a2])\n"
+                "fcvt.ps.pw f11, f11\n"
+                "fmadd.ps   f10, f11, f12, f10\n"
+                "flw.ps     f12, 96(%[b])\n"
+                "fgb.ps     f11, f31(%[a3])\n"
+                "fcvt.ps.pw f11, f11\n"
+                "fmadd.ps   f10, f11, f12, f10\n"
+                "fswizz.ps  f1, f10, 0xB1\n"
+                "fadd.ps    f2, f10, f1, rne\n"
+                "fswizz.ps  f3, f2, 0x4E\n"
+                "fadd.ps    f4, f2, f3, rne\n"
+                "fmvz.x.ps  t0, f4, 4\n"
+                "fbcx.ps    f5, t0\n"
+                "fadd.ps    %[out], f4, f5, rne\n"
+                : [out] "=f"(acc)
+                : [gb] "m"(*(const int32_t (*)[8]) gather_bytes), [a] "r"(blk->qs), [a1] "r"(blk->qs + 8),
+                  [a2] "r"(blk->qs + 16), [a3] "r"(blk->qs + 24), [b] "r"(b)
+                : "memory", "t0", "f1", "f2", "f3", "f4", "f5", "f10", "f11", "f12", "f31");
+            row_sum += acc * scales[i];
+        }
+    }
+
+    for (int64_t kb = tail_start; kb < K_blocks; kb++) {
+        row_sum += compute_row_dot_q8_0(q_row + kb, b_col_base + (kb << 5), 1);
+    }
+
+    return row_sum;
+}
 
 int entry_point(struct ggml_et_mm_q8_params * params, void * env) {
     uint64_t hart_id = get_hart_id();
@@ -90,21 +161,16 @@ int entry_point(struct ggml_et_mm_q8_params * params, void * env) {
     const size_t nbb3      = params->bias.nb[3];
 
     // Q8_0 block size is 32
-    const int64_t K_blocks      = K / 32;
-    const int     use_simple_x2 = ((nb01 & 31) == 0);
+    const int64_t K_blocks = K / 32;
 
     // Broadcasting ratios
     const int64_t r2 = ne12 / ne02;
     const int64_t r3 = ne13 / ne03;
 
     if (K_blocks > TILE_KB) {
-        /*
-         * Tile-outer with scalar row groups: process up to 4 rows per
-         * hart sharing each B tile before advancing to the next tile.
-         * Uses scalar float variables (not an array) to accumulate across
-         * tiles - avoids the flw/fadd.s/fsw stack ops that corrupt vector
-         * register state on ET-SoC-1's MMX-style shared FP file.
-         */
+        /* Tile-outer path (large K, e.g. other regression models) --
+         * unchanged from Combo A/B, uses only confirmed-available
+         * primitives, no scale-convert or prefetch changes here. */
         for (int64_t i3 = 0; i3 < ne13; i3++) {
             const int64_t i03       = i3 / r3;
             const char *  src0_ptr3 = (const char *) params->src0.data + i03 * nb03;
@@ -174,11 +240,10 @@ int entry_point(struct ggml_et_mm_q8_params * params, void * env) {
         }
     } else {
         /*
-         * Simple path for small K.
-         *
-         * When `nb01` is 32-byte aligned, every row has the same block-alignment
-         * pattern. That lets us compute two rows together and reuse each loaded
-         * B chunk across both rows instead of reloading it in a second dot call.
+         * Simple path: mask-hoisted (once per n, via q8_dot_begin/end),
+         * per-row prefetch of the next row, batched-8 scale-convert per
+         * row. Uniform per-hart striping (no x2-row pairing -- traded
+         * away in this combo for the batched scale-convert, see header).
          */
         for (int64_t i3 = 0; i3 < ne13; i3++) {
             const int64_t i03       = i3 / r3;
@@ -200,45 +265,15 @@ int entry_point(struct ggml_et_mm_q8_params * params, void * env) {
                     q8_dot_state  q8_state;
                     q8_dot_begin(&q8_state);
 
-                    if (use_simple_x2) {
-                        for (int64_t m0 = hart_id; m0 < M; m0 += STRIDE_M * SIMPLE_X2_ROWS) {
-                            const int64_t      m1     = m0 + STRIDE_M;
-                            const block_q8_0 * q_row0 = (const block_q8_0 *) (src0_ptr2 + m0 * nb01);
+                    for (int64_t m = (int64_t) hart_id; m < M; m += STRIDE_M) {
+                        const block_q8_0 * q_row = (const block_q8_0 *) (src0_ptr2 + m * nb01);
+                        float sum = compute_row_dot_q8_0_scaleunpack_nomask(q_row, b_col_base, K_blocks);
 
-                            if (m1 < M) {
-                                const block_q8_0 * q_row1 = (const block_q8_0 *) (src0_ptr2 + m1 * nb01);
-                                float              s0, s1;
-                                q8_dot_compute_x2_aligned(q_row0, q_row1, b_col_base, K_blocks, &s0, &s1);
-
-                                float * dst0 = (float *) (dst_ptr2 + n * nbd1 + m0 * sizeof(float));
-                                float * dst1 = (float *) (dst_ptr2 + n * nbd1 + m1 * sizeof(float));
-                                if (bias_n) {
-                                    s0 += bias_n[m0];
-                                    s1 += bias_n[m1];
-                                }
-                                atomic_store_f32((volatile float *) dst0, s0);
-                                atomic_store_f32((volatile float *) dst1, s1);
-                            } else {
-                                float   sum = q8_dot_compute(q_row0, b_col_base, K_blocks);
-                                float * dst = (float *) (dst_ptr2 + n * nbd1 + m0 * sizeof(float));
-                                if (bias_n) {
-                                    sum += bias_n[m0];
-                                }
-                                atomic_store_f32((volatile float *) dst, sum);
-                            }
+                        float * dst_entry = (float *) (dst_ptr2 + n * nbd1 + m * sizeof(float));
+                        if (bias_n) {
+                            sum += bias_n[m];
                         }
-                    } else {
-                        for (int64_t m = hart_id; m < M; m += STRIDE_M) {
-                            const block_q8_0 * q_row = (const block_q8_0 *) (src0_ptr2 + m * nb01);
-
-                            float sum = q8_dot_compute(q_row, b_col_base, K_blocks);
-
-                            float * dst_entry = (float *) (dst_ptr2 + n * nbd1 + m * sizeof(float));
-                            if (bias_n) {
-                                sum += bias_n[m];
-                            }
-                            atomic_store_f32((volatile float *) dst_entry, sum);
-                        }
+                        atomic_store_f32((volatile float *) dst_entry, sum);
                     }
 
                     q8_dot_end(&q8_state);
