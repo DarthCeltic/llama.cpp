@@ -10,52 +10,130 @@
 #include "quants.h"
 #include "block_ops.h"
 
-// Using the block prefetch logic
-static inline void prefetch_weight_row(const void* start_ptr, int64_t num_blocks, uint32_t worker_id) {
-    const uint64_t cache_line_size = 64;
+// Lightweight next-row prefetch.
+//
+// A prior attempt (PR#168's first version) reused the existing
+// prefetch_weight_row() helper, calling it 8 times per row (once per
+// worker_id 0..7) to cover the whole row -- its 8-way partitioning
+// (division/modulo math to split a range across 8 COOPERATING workers) was
+// designed for multiple harts prefetching a SHARED range together, not this
+// loop's access pattern where exactly ONE hart owns its row exclusively. A
+// real board run proved that 8x-per-row overhead is a net regression
+// (-3.3%, tight CV both sides -- see corpus entry
+// mask_hoist_plus_weight_row_prefetch_commit_11b05e9c). This is a from-
+// scratch, independent reimplementation of the SAME underlying hardware
+// primitive (the prefetch_va CSR, 0x81f) WITHOUT the unneeded worker-
+// partitioning math: one direct loop over the row's own cache lines, issued
+// ONCE per row instead of 8 times. The CSR's NumLines field is 4 bits (max
+// 16 lines per csrw), so a K=2048 row (~34 lines) still needs ~3 CSR writes
+// -- but with none of the division/modulo setup repeated 8x for no reason.
+static inline void prefetch_row_light(const void* start_ptr, int64_t num_blocks) {
     uintptr_t self_ptr = (uintptr_t)start_ptr;
-    uintptr_t self_ptr_end = self_ptr + (num_blocks * sizeof(block_q8_0));
+    uintptr_t self_ptr_end = self_ptr + (uintptr_t)(num_blocks * (int64_t)sizeof(block_q8_0));
+    uint64_t startCL = ((uint64_t)self_ptr + 63) >> 6;
+    uint64_t endCL = ((uint64_t)self_ptr_end + 63) >> 6;
+    if (endCL < startCL) {
+        return;
+    }
+    int64_t pending_lines = (int64_t)(endCL - startCL + 1);
+    self_ptr = (uintptr_t)(startCL << 6);
 
-    // 1. Align to cache lines and calculate range
-    uint64_t startCL = (self_ptr + 63) >> 6;
-    uint64_t endCL = (self_ptr_end + 63) >> 6;
-    if (endCL >= startCL) {
-        uint64_t total_lines = endCL - startCL + 1;
-        // 2. Load balance across the minions in the Shire (assuming 8 per group for this logic)
-        // Adjust worker_id if using global_id
-        uint32_t local_worker_id = worker_id % 8;
-        uint64_t lines_per_minion = total_lines >> 3;
-        uint64_t extra = total_lines & 7;
+    for (; pending_lines > 0; pending_lines -= 16) {
+        uint64_t current_batch = (uint64_t)((pending_lines > 16 ? 16 : pending_lines) - 1);
+        __asm__ __volatile__(
+            "li    x1, 0x400000000000000 \n"  // Dest = L2 (bits 59:58 = 01)
+            "or    x3, x1, %[ptr]\n"           // Combine Dest + VA
+            "or    x3, x3, %[sz]\n"            // Combine with NumLines
+            "csrw  0x81f, x3\n"                // prefetch_va
+            :
+            : [ptr] "r"(self_ptr), [sz] "r"(current_batch)
+            : "x1", "x3", "memory"
+        );
+        self_ptr += (16 * 64);
+    }
+}
 
-        uint64_t offset = local_worker_id * lines_per_minion;
-        if (local_worker_id < extra) {
-            offset += local_worker_id;
-            lines_per_minion++;
-        } else {
-            offset += extra;
+// Row dot product with vectorized fp16 block-scale unpack (unchanged from
+// the already-verified scale-unpack lever).
+static inline float compute_row_dot_product_q8_0_scaleunpack(
+    const block_q8_0* q_row, const float* b_col_base, int64_t K_blocks) {
+    static const int32_t gather_bytes[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+    static const int32_t f16_pattern[8]  = {0, 2, 4, 6, 8, 10, 12, 14};
+
+    unsigned long saved_mask;
+    __asm__ volatile("mova.x.m %0" : "=r"(saved_mask));
+    __asm__ volatile("mov.m.x m0, x0, 0xFF");
+
+    float row_sum = 0.0f;
+    const int64_t groups = K_blocks / 8;
+    const int64_t tail_start = groups * 8;
+
+    for (int64_t g = 0; g < groups; g++) {
+        uint16_t deltas[8] __attribute__((aligned(16)));
+        for (int i = 0; i < 8; i++) {
+            deltas[i] = q_row[g * 8 + i].d;
         }
-        self_ptr = (startCL + offset) << 6;
-        int pending_lines = lines_per_minion;
+        float scales[8] __attribute__((aligned(32)));
+        __asm__ volatile(
+            "flw.ps    f21, %[pat]\n"
+            "fgh.ps    f20, f21(%[d])\n"
+            "fcvt.ps.f16 f20, f20\n"
+            "fsw.ps    f20, %[out]\n"
+            : [out] "=m"(*(float(*)[8])scales)
+            : [d] "r"(deltas),
+              [pat] "m"(*(const int32_t(*)[8])f16_pattern)
+            : "f20", "f21"
+        );
 
-        // 3. Hardware Prefetch Loop (16 lines at a time)
-        for (; pending_lines > 0; pending_lines -= 16) {
-            uint64_t current_batch = (pending_lines > 16 ? 16 : pending_lines) - 1;
-            uint64_t self_size = current_batch; // bits 3:0
+        for (int i = 0; i < 8; i++) {
+            const block_q8_0* blk = q_row + g * 8 + i;
+            const float* b = b_col_base + ((int64_t)(g * 8 + i) << 5);
 
-            __asm__ __volatile__ (
-                "li    x1, 0x400000000000000 \n"  // Dest = L2 (bits 59:58 = 01)
-                "addi  x31, zero, 64\n"  // Stride = 64 bytes
-                "or    x3, x1, %[ptr]\n"  // Combine Dest + VA
-                "or    x3, x3, %[sz]\n"  // Combine with NumLines
-                "csrw  0x81f, x3\n"  // prefetch_va
-                :
-                : [ptr] "r" (self_ptr),
-                  [sz] "r" (self_size)
-                : "x1", "x3", "x31", "memory"
+            float acc;
+            __asm__ volatile(
+                "flw.ps   f31, %[gb]\n"
+                "fbci.pi  f10, 0\n"
+                "flw.ps   f12, 0(%[b])\n"
+                "fgb.ps   f11, f31(%[a])\n"
+                "fcvt.ps.pw f11, f11\n"
+                "fmadd.ps f10, f11, f12, f10\n"
+                "flw.ps   f12, 32(%[b])\n"
+                "fgb.ps   f11, f31(%[a1])\n"
+                "fcvt.ps.pw f11, f11\n"
+                "fmadd.ps f10, f11, f12, f10\n"
+                "flw.ps   f12, 64(%[b])\n"
+                "fgb.ps   f11, f31(%[a2])\n"
+                "fcvt.ps.pw f11, f11\n"
+                "fmadd.ps f10, f11, f12, f10\n"
+                "flw.ps   f12, 96(%[b])\n"
+                "fgb.ps   f11, f31(%[a3])\n"
+                "fcvt.ps.pw f11, f11\n"
+                "fmadd.ps f10, f11, f12, f10\n"
+                "fswizz.ps f1, f10, 0xB1\n"
+                "fadd.ps   f2, f10, f1, rne\n"
+                "fswizz.ps f3, f2, 0x4E\n"
+                "fadd.ps   f4, f2, f3, rne\n"
+                "fmvz.x.ps t0, f4, 4\n"
+                "fbcx.ps   f5, t0\n"
+                "fadd.ps   %[out], f4, f5, rne\n"
+                : [out] "=f"(acc)
+                : [gb] "m"(*(const int32_t(*)[8])gather_bytes),
+                  [a] "r"(blk->qs), [a1] "r"(blk->qs + 8),
+                  [a2] "r"(blk->qs + 16), [a3] "r"(blk->qs + 24),
+                  [b] "r"(b)
+                : "memory", "t0", "f1", "f2", "f3", "f4", "f5",
+                  "f10", "f11", "f12", "f31"
             );
-            self_ptr += (16 * 64);
+            row_sum += acc * scales[i];
         }
     }
+
+    for (int64_t kb = tail_start; kb < K_blocks; kb++) {
+        row_sum += compute_block_dot_product_q8_0_masked(q_row + kb, b_col_base + (kb << 5));
+    }
+
+    __asm__ volatile("mova.m.x %0" :: "r"(saved_mask));
+    return row_sum;
 }
 
 int entry_point(struct ggml_et_binary_params* params, void* env) {
@@ -103,35 +181,28 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
             const char* src1_ptr2 = src1_ptr3 + i2 * nb12;
             char* dst_ptr2       = dst_ptr3 + i2 * nbd2;
 
+            // Original per-element hart striping (preserves full 2048-way
+            // parallelism for this model's M -- see corpus entry
+            // ..._PARALLELISM_BUG_20260723 for why restructuring this to
+            // stripe over cache lines/tiles instead collapses parallelism).
             for (int64_t n = 0; n < N; n++) {
-                // src1 is F32, so column pointer moves by nb11
                 const float* b_col_base = (const float*)(src1_ptr2 + n * nb11);
 
-                for (int64_t m = hart_id; m < M; m += stride_m) {
-                    // src0 is Q8_0 blocks, row pointer moves by nb01
-                    const block_q8_0* q_row = (const block_q8_0*)(src0_ptr2 + m * nb01);
-                    float sum = 0.0f;
-
-                    // Set the vector mask ONCE for this row's whole K_blocks
-                    // loop instead of paying a save/set/restore CSR sequence
-                    // on every 32-element block call -- see
-                    // compute_block_dot_product_q8_0_masked in block_ops.h.
-                    // Mask CSR state is untouched by anything else between
-                    // these two asm blocks, so this is value-identical to
-                    // the per-call save/set/restore it replaces.
-                    unsigned long saved_mask;
-                    __asm__ volatile("mova.x.m %0" : "=r"(saved_mask));
-                    __asm__ volatile("mov.m.x m0, x0, 0xFF");
-
-                    for (int64_t kb = 0; kb < K_blocks; kb++) {
-                        // q_row is a pointer to blocks, so + kb moves by sizeof(block_q8_0)
-                        // b_col is float*, so we move 32 elements (kb << 5)
-                        sum += compute_block_dot_product_q8_0_masked(q_row + kb, b_col_base + (kb << 5));
+                for (int64_t m = (int64_t)hart_id; m < M; m += stride_m) {
+                    // Prefetch this hart's OWN next row (m + stride_m) into
+                    // L2 before computing the current one, so its memory
+                    // latency overlaps this row's compute instead of
+                    // stalling the next iteration. One lightweight call per
+                    // row (see prefetch_row_light above), not 8.
+                    const int64_t m_next = m + stride_m;
+                    if (m_next < M) {
+                        const void* next_row_ptr = (const void*)(src0_ptr2 + m_next * nb01);
+                        prefetch_row_light(next_row_ptr, K_blocks);
                     }
 
-                    __asm__ volatile("mova.m.x %0" :: "r"(saved_mask));
+                    const block_q8_0* q_row = (const block_q8_0*)(src0_ptr2 + m * nb01);
+                    float sum = compute_row_dot_product_q8_0_scaleunpack(q_row, b_col_base, K_blocks);
 
-                    // Store result in dst[m, n, i2, i3]
                     float* dst_entry = (float*)(dst_ptr2 + n * nbd1 + m * sizeof(float));
                     atomic_store_f32((volatile float*)dst_entry, sum);
                 }
