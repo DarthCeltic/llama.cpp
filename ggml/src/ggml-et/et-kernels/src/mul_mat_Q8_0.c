@@ -2,45 +2,33 @@
 // MUL_MAT Kernel
 // Matrix multiplication: C[M,N] = A[M,K] * B[K,N]
 //
-// COMBO A -- structural base, unmodified.
+// COMBO B (v2, FIXED) -- Combo A (Rehan structural base, attribution +
+// exclusions documented there) + one additive lever Rehan's kernel does not
+// have at all: single-call-per-row DRAM prefetch of this hart's NEXT
+// row(s), hiding their load latency behind the current row's compute. Uses
+// the prefetch_va CSR (0x81f) -- a from-scratch reimplementation (not
+// reused from our own earlier 8-calls/row attempt, which board-proved a
+// -3.3% regression; see corpus entry
+// mask_hoist_plus_weight_row_prefetch_commit_11b05e9c).
 //
-// Kernel body is RehanQasim-dev's Q8_0 matrix-engine GEMM design
-// (aifoundry-org/llama.cpp commit 84405bb7f86458c60c9f47a6a140f1c876da8532,
-// "et-backend: Q8_0 matrix-engine GEMM kernel for prefill"), rebuilt here
-// against the CURRENT shared main tip (f67c2b2a30a24bf9354857cde0f233620a20eb23)
-// -- his own commit had diverged from current main's block_ops.h/mul_mat_Q8_0.c,
-// so this is a from-source graft (his q8_dot_* API merged into current main's
-// block_ops.h), not a blind file copy. Used under Ryan Gurganious/DarthCeltic's
-// explicit account-owner authorization from RehanQasim-dev to build on his code
-// for this track (see corpus entry
-// hackathon_llama32_1b_ABI_COMPAT_and_THREE_COMBO_PLAN_20260723).
-//
-// This PR (#168) is the empirical control: does this structure alone, freshly
-// rebuilt, reproduce his ~14.7 tok/s? PR#169/#170 layer independently-built,
-// additive levers (light prefetch, batched scale-convert) on top of this same
-// base, so real board data -- not prediction -- shows what each addition is
-// actually worth.
-//
-// EXCLUDED ON PURPOSE: Rehan's K-split / K-split-group branches (both-harts-
-// share-a-row via an L2SCP exchange + semaphore barrier) called
-// et_sem_post/et_sem_wait, et_shire_l2scp_local, and a whole-tensor
-// evict_region_past_l2 helper -- NONE of these exist anywhere in current
-// shared main's platform.h (grepped the full et-kernels/src tree at
-// f67c2b2a30a24bf9354857cde0f233620a20eb23, confirmed absent). His fork added
-// that semaphore infrastructure itself; it never landed on the shared tip.
-// Hand-guessing a semaphore/barrier implementation with no reference to
-// verify against is not a risk worth taking on real hardware (silent
-// wrong-answer or hang). Checked the actual shape math for llama32_1b
-// (hidden=2048, intermediate=8192, vocab=128256): every Q8_0 matmul's
-// K_blocks is <=256 (TILE_KB), so the tile-outer and K-split-group branches
-// are dead code for this model's shapes anyway -- except the K-split "small
-// rows" carve-out, which specifically would help k_proj/v_proj at M=512
-// (1536 of 2048 harts otherwise idle under plain striping). That specific
-// gap is real and left as an open, flagged opportunity for anyone who can
-// source the real semaphore primitives -- not silently dropped. Tile-outer
-// is kept (uses only confirmed-available primitives) for robustness against
-// the OTHER 11 regression-check models, which may have larger K than this
-// track's target model.
+// v1 of this combo (oracle-verified 9/9 OK on the small test-backend-ops
+// fixture) CRASHED on the real board on the actual full model: "ET: stream
+// error detected at synchronization point... llama-bench exited rc=-6"
+// (SIGABRT) during warmup, on every dispatch. Combo A (identical otherwise,
+// no prefetch) ran clean on the SAME real model. Root cause: v1's
+// prefetch_row_light() issued the prefetch_va CSR write but, unlike every
+// OTHER cache-management CSR operation in this codebase (flush_to_l2,
+// evict_to_l2 -- both always paired with FENCE+WAIT_CACHEOPS by their
+// callers), never drained/waited for it. The small oracle fixture (a single
+// isolated MUL_MAT dispatch, m=16 n=1..9 k=256) never dispatches enough
+// back-to-back kernels for an undrained prefetch backlog to surface --
+// exactly why it passed there and failed on a real 16-layer decode loop.
+// v2 fix: FENCE + WAIT_CACHEOPS after each prefetch_row_light() batch,
+// matching the drain pattern used everywhere else in this codebase for
+// cache-op CSRs. Re-verified against the small-fixture oracle (still 9/9
+// OK, as expected -- that fixture cannot exercise the bug either way) but
+// this fix has NOT yet been confirmed against a real full-model board run
+// at the time of this commit -- flagged, not silently assumed fixed.
 //
 // Verified via llama.cpp's own test-backend-ops oracle against the real ET
 // software-emulator backend before submission.
@@ -57,6 +45,36 @@
 #define STRIDE_M       2048 /* 32 shires x 32 minions x 2 harts */
 #define TILE_KB        256  /* K-tile size in Q8_0 blocks (8192 elems, 32KB B data) */
 #define SIMPLE_X2_ROWS 2
+
+// Prefetch one row's worth of Q8_0 blocks into L2, ONE call covering the
+// whole row (not 8 -- see file header for why the original 8x/row attempt
+// was a proven regression).
+static inline void prefetch_row_light(const void * start_ptr, int64_t num_blocks) {
+    uintptr_t self_ptr     = (uintptr_t) start_ptr;
+    uintptr_t self_ptr_end = self_ptr + (uintptr_t) (num_blocks * (int64_t) sizeof(block_q8_0));
+    uint64_t  startCL      = ((uint64_t) self_ptr + 63) >> 6;
+    uint64_t  endCL        = ((uint64_t) self_ptr_end + 63) >> 6;
+    if (endCL < startCL) {
+        return;
+    }
+    int64_t pending_lines = (int64_t) (endCL - startCL + 1);
+    self_ptr               = (uintptr_t) (startCL << 6);
+
+    for (; pending_lines > 0; pending_lines -= 16) {
+        uint64_t current_batch = (uint64_t) ((pending_lines > 16 ? 16 : pending_lines) - 1);
+        __asm__ __volatile__(
+            "li    x1, 0x400000000000000 \n"  // Dest = L2 (bits 59:58 = 01)
+            "or    x3, x1, %[ptr]\n"           // Combine Dest + VA
+            "or    x3, x3, %[sz]\n"            // Combine with NumLines
+            "csrw  0x81f, x3\n"                // prefetch_va
+            :
+            : [ptr] "r"(self_ptr), [sz] "r"(current_batch)
+            : "x1", "x3", "memory");
+        self_ptr += (16 * 64);
+    }
+    FENCE;
+    WAIT_CACHEOPS;
+}
 
 int entry_point(struct ggml_et_mm_q8_params * params, void * env) {
     uint64_t hart_id = get_hart_id();
@@ -179,6 +197,11 @@ int entry_point(struct ggml_et_mm_q8_params * params, void * env) {
          * When `nb01` is 32-byte aligned, every row has the same block-alignment
          * pattern. That lets us compute two rows together and reuse each loaded
          * B chunk across both rows instead of reloading it in a second dot call.
+         *
+         * Each iteration also prefetches this hart's NEXT row(s) before
+         * computing the current one(s), so the next iteration's DRAM load
+         * latency overlaps this iteration's vector compute instead of
+         * stalling on it.
          */
         for (int64_t i3 = 0; i3 < ne13; i3++) {
             const int64_t i03       = i3 / r3;
@@ -201,9 +224,19 @@ int entry_point(struct ggml_et_mm_q8_params * params, void * env) {
                     q8_dot_begin(&q8_state);
 
                     if (use_simple_x2) {
-                        for (int64_t m0 = hart_id; m0 < M; m0 += STRIDE_M * SIMPLE_X2_ROWS) {
+                        const int64_t stride2 = STRIDE_M * SIMPLE_X2_ROWS;
+                        for (int64_t m0 = hart_id; m0 < M; m0 += stride2) {
                             const int64_t      m1     = m0 + STRIDE_M;
                             const block_q8_0 * q_row0 = (const block_q8_0 *) (src0_ptr2 + m0 * nb01);
+
+                            const int64_t m0_next = m0 + stride2;
+                            if (m0_next < M) {
+                                prefetch_row_light((const void *) (src0_ptr2 + m0_next * nb01), K_blocks);
+                                const int64_t m1_next = m0_next + STRIDE_M;
+                                if (m1_next < M) {
+                                    prefetch_row_light((const void *) (src0_ptr2 + m1_next * nb01), K_blocks);
+                                }
+                            }
 
                             if (m1 < M) {
                                 const block_q8_0 * q_row1 = (const block_q8_0 *) (src0_ptr2 + m1 * nb01);
@@ -230,6 +263,11 @@ int entry_point(struct ggml_et_mm_q8_params * params, void * env) {
                     } else {
                         for (int64_t m = hart_id; m < M; m += STRIDE_M) {
                             const block_q8_0 * q_row = (const block_q8_0 *) (src0_ptr2 + m * nb01);
+
+                            const int64_t m_next = m + STRIDE_M;
+                            if (m_next < M) {
+                                prefetch_row_light((const void *) (src0_ptr2 + m_next * nb01), K_blocks);
+                            }
 
                             float sum = q8_dot_compute(q_row, b_col_base, K_blocks);
 
