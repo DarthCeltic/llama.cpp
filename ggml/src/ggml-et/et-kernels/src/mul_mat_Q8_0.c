@@ -282,6 +282,31 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
                     const block_q8_0* q_row = (const block_q8_0*)(src0_ptr2 + m * nb01);
                     float sum = 0.0f;
 
+                    // Prefetch THIS hart's own next row (m + stride_m) into
+                    // L2 before computing the current one, so its memory
+                    // latency overlaps this row's compute time instead of
+                    // stalling the next iteration. This is the path that
+                    // actually runs for single-token decode (N<4, e.g. the
+                    // llama32_1b tokens/s track): N8/N4 above are 0 iterations
+                    // when N==1, so this loop is the whole story for decode
+                    // speed. prefetch_weight_row was already written but never
+                    // called anywhere in this codebase (confirmed via
+                    // full-tree grep) -- called 8 times here (by this same
+                    // hart, for its own next row) to prefetch the complete
+                    // row, since its 8-way worker_id%8 split was designed for
+                    // cooperative multi-hart prefetching of a SHARED range,
+                    // which does not match this loop's per-hart-exclusive-
+                    // row access pattern. This is a pure prefetch HINT (csrw
+                    // to a prefetch CSR) -- a wrong or useless target cannot
+                    // corrupt output, only fail to help.
+                    const int64_t m_next = m + stride_m;
+                    if (m_next < M) {
+                        const void* next_row_ptr = (const void*)(src0_ptr2 + m_next * nb01);
+                        for (uint32_t w = 0; w < 8; w++) {
+                            prefetch_weight_row(next_row_ptr, K_blocks, w);
+                        }
+                    }
+
                     // Set the vector mask ONCE for this row's whole K_blocks
                     // loop instead of paying a save/set/restore CSR sequence
                     // on every 32-element block call -- see
