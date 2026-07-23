@@ -74,6 +74,244 @@ static inline float compute_block_dot_product_q8_0(const block_q8_0* a_block, co
     return final_sum * scale;
 }
 
+//******************************************************************************
+// Split-phase Q8_0 dot product API
+//
+// Source: RehanQasim-dev, "et-backend: Q8_0 matrix-engine GEMM kernel for
+// prefill" (aifoundry-org/llama.cpp commit 84405bb7f86458c60c9f47a6a140f1c876da8532),
+// grafted onto current main's block_ops.h (Rehan's own branch had diverged
+// from this file's current shared state -- see corpus entry
+// hackathon_llama32_1b_ABI_COMPAT_and_THREE_COMBO_PLAN_20260723). Used here
+// under Ryan Gurganious/DarthCeltic's explicit account-owner authorization
+// from RehanQasim-dev to build on his code for this track.
+//
+//   q8_dot_begin(st)      -- save mask, set mask 0xFF
+//   q8_dot_reset()        -- zero vector accumulator f20
+//   q8_dot_tile(q, b, n)  -- accumulate n Q8_0 blocks into f20
+//   q8_dot_reduce()       -- horizontal sum of f20, return scalar float
+//   q8_dot_end(st)        -- restore original mask
+//
+// Register contract:
+//   f20       -- row accumulator (persistent across tiles, reset per row)
+//   f31       -- gather pattern (reloaded per q8_dot_tile call)
+//   f10-f12   -- scratch within tile
+//   f15       -- scale broadcast within tile
+//   f1-f5, t0 -- scratch within reduce
+//******************************************************************************
+
+static inline void __attribute__((always_inline)) q8_dot_reset(void) {
+    __asm__ volatile("fbci.pi f20, 0" ::: "f20");
+}
+
+// Accumulate n_blocks Q8_0 blocks into f20.
+static inline void __attribute__((always_inline)) q8_dot_tile(const block_q8_0 * q_row,
+                                                              const float *      b_col,
+                                                              int64_t            n_blocks) {
+    const int32_t  gather_pattern[8] = { 0, 1, 2, 3, 4, 5, 6, 7 };
+
+    __asm__ volatile("flw.ps f31, %[g]\n" : : [g] "m"(*(const int32_t (*)[8]) gather_pattern) : "f31");
+
+    for (int64_t kb = 0; kb < n_blocks; kb++) {
+        const block_q8_0 * blk   = q_row + kb;
+        const float *      b_ptr = b_col + (kb << 5);
+
+        __asm__ volatile(
+            "fbci.pi     f10, 0\n"
+            "flw.ps      f12, %[bv0]\n"
+            "fgb.ps      f11, f31(%[ap0])\n"
+            "fcvt.ps.pw  f11, f11\n"
+            "fmadd.ps    f10, f11, f12, f10\n"
+            "flw.ps      f12, %[bv1]\n"
+            "fgb.ps      f11, f31(%[ap1])\n"
+            "fcvt.ps.pw  f11, f11\n"
+            "fmadd.ps    f10, f11, f12, f10\n"
+            "flw.ps      f12, %[bv2]\n"
+            "fgb.ps      f11, f31(%[ap2])\n"
+            "fcvt.ps.pw  f11, f11\n"
+            "fmadd.ps    f10, f11, f12, f10\n"
+            "flw.ps      f12, %[bv3]\n"
+            "fgb.ps      f11, f31(%[ap3])\n"
+            "fcvt.ps.pw  f11, f11\n"
+            "fmadd.ps    f10, f11, f12, f10\n"
+            :
+            : [ap0] "r"(&blk->qs[0]), [ap1] "r"(&blk->qs[8]), [ap2] "r"(&blk->qs[16]), [ap3] "r"(&blk->qs[24]),
+              [bv0] "m"(*(const float (*)[8]) & b_ptr[0]), [bv1] "m"(*(const float (*)[8]) & b_ptr[8]),
+              [bv2] "m"(*(const float (*)[8]) & b_ptr[16]), [bv3] "m"(*(const float (*)[8]) & b_ptr[24])
+            : "f10", "f11", "f12");
+
+        // f20 += f10 * broadcast(scale) -- hardware fp16->fp32 via FCVT.PS.F16
+        uint32_t scale_raw = (uint32_t) blk->d;
+        __asm__ volatile(
+            "fbcx.ps f15, %[sb]\n"
+            "fcvt.ps.f16 f15, f15\n"
+            "fmadd.ps f20, f10, f15, f20\n"
+            :
+            : [sb] "r"(scale_raw)
+            : "f15", "f20");
+    }
+}
+
+// Horizontal sum of 8-element vector accumulator f20.
+static inline float __attribute__((always_inline)) q8_dot_reduce(void) {
+    float result;
+    __asm__ __volatile__(
+        "fswizz.ps f1, f20, 0xB1 \n\t"
+        "fadd.ps   f2, f20, f1, rne \n\t"
+        "fswizz.ps f3, f2, 0x4E \n\t"
+        "fadd.ps   f4, f2, f3, rne \n\t"
+        "fmvz.x.ps t0, f4, 4 \n\t"
+        "fbcx.ps   f5, t0 \n\t"
+        "fadd.ps   %[vout], f4, f5, rne \n\t"
+        : [vout] "=f"(result)::"t0", "f1", "f2", "f3", "f4", "f5");
+    return result;
+}
+
+// Full-row dot product (convenience wrapper)
+static inline float compute_row_dot_q8_0(const block_q8_0 * q_row, const float * b_col, int64_t K_blocks) {
+    unsigned long saved_mask;
+    __asm__ volatile("mova.x.m %0" : "=r"(saved_mask));
+    __asm__ volatile("mov.m.x m0, x0, 0xFF");
+    q8_dot_reset();
+    q8_dot_tile(q_row, b_col, K_blocks);
+    float result = q8_dot_reduce();
+    __asm__ volatile("mova.m.x %0" ::"r"(saved_mask));
+    return result;
+}
+
+//******************************************************************************
+// Hoisted Q8_0 dot API
+//
+// q8_dot_begin/end save/restore the vector mask once around a long sequence of
+// dot products, so the per-row mask shuffles are hoisted out of the inner
+// loops. q8_dot_compute does a full-row dot (no mask handling). The _x2
+// variant computes two rows together while reusing each loaded B chunk --
+// only safe when both row pointers share the same 32-byte alignment phase
+// (i.e. the Q8 row stride is a multiple of 32).
+//******************************************************************************
+
+typedef struct {
+    unsigned long saved_mask;
+} q8_dot_state;
+
+static inline void q8_dot_begin(q8_dot_state * state) {
+    __asm__ volatile("mova.x.m %0" : "=r"(state->saved_mask));
+    __asm__ volatile("mov.m.x m0, x0, 0xFF");
+}
+
+static inline void q8_dot_end(const q8_dot_state * state) {
+    __asm__ volatile("mova.m.x %0" ::"r"(state->saved_mask));
+}
+
+// Equivalent to q8_dot_reset+tile+reduce, without touching the mask register.
+// Caller is responsible for q8_dot_begin/end around the surrounding loop.
+static inline float q8_dot_compute(const block_q8_0 * q_row, const float * b_col, int64_t K_blocks) {
+    q8_dot_reset();
+    q8_dot_tile(q_row, b_col, K_blocks);
+    return q8_dot_reduce();
+}
+
+// Compute two row dots together while reusing the same loaded B chunks.
+//
+// Safe when every row starts at the same 32-byte offset, i.e. the Q8 row stride
+// is a multiple of 32. In that case the gather/alignment pattern is the same
+// for both rows at a given `kb`, so one set of B vector loads feeds both row
+// accumulators.
+static inline void q8_dot_compute_x2_aligned(const block_q8_0 * q_row0,
+                                             const block_q8_0 * q_row1,
+                                             const float *      b_col,
+                                             int64_t            K_blocks,
+                                             float *            out0,
+                                             float *            out1) {
+    const int32_t gather_pattern[8] = { 0, 1, 2, 3, 4, 5, 6, 7 };
+    __asm__ volatile("flw.ps f31, %[g]\n" : : [g] "m"(*(const int32_t (*)[8]) gather_pattern) : "f31");
+    __asm__ volatile(
+        "fbci.pi f20, 0\n"
+        "fbci.pi f21, 0\n" ::
+            : "f20", "f21");
+
+    for (int64_t kb = 0; kb < K_blocks; kb++) {
+        const block_q8_0 * blk0  = q_row0 + kb;
+        const block_q8_0 * blk1  = q_row1 + kb;
+        const float *      b_ptr = b_col + (kb << 5);
+
+        __asm__ volatile(
+            "fbci.pi     f10, 0\n"
+            "fbci.pi     f11, 0\n"
+
+            "flw.ps      f12, %[bv0]\n"
+            "fgb.ps      f16, f31(%[r0ap0])\n"
+            "fcvt.ps.pw  f16, f16\n"
+            "fmadd.ps    f10, f16, f12, f10\n"
+            "fgb.ps      f17, f31(%[r1ap0])\n"
+            "fcvt.ps.pw  f17, f17\n"
+            "fmadd.ps    f11, f17, f12, f11\n"
+
+            "flw.ps      f13, %[bv1]\n"
+            "fgb.ps      f16, f31(%[r0ap1])\n"
+            "fcvt.ps.pw  f16, f16\n"
+            "fmadd.ps    f10, f16, f13, f10\n"
+            "fgb.ps      f17, f31(%[r1ap1])\n"
+            "fcvt.ps.pw  f17, f17\n"
+            "fmadd.ps    f11, f17, f13, f11\n"
+
+            "flw.ps      f14, %[bv2]\n"
+            "fgb.ps      f16, f31(%[r0ap2])\n"
+            "fcvt.ps.pw  f16, f16\n"
+            "fmadd.ps    f10, f16, f14, f10\n"
+            "fgb.ps      f17, f31(%[r1ap2])\n"
+            "fcvt.ps.pw  f17, f17\n"
+            "fmadd.ps    f11, f17, f14, f11\n"
+
+            "flw.ps      f15, %[bv3]\n"
+            "fgb.ps      f16, f31(%[r0ap3])\n"
+            "fcvt.ps.pw  f16, f16\n"
+            "fmadd.ps    f10, f16, f15, f10\n"
+            "fgb.ps      f17, f31(%[r1ap3])\n"
+            "fcvt.ps.pw  f17, f17\n"
+            "fmadd.ps    f11, f17, f15, f11\n"
+            :
+            : [r0ap0] "r"(&blk0->qs[0]), [r0ap1] "r"(&blk0->qs[8]), [r0ap2] "r"(&blk0->qs[16]), [r0ap3] "r"(&blk0->qs[24]),
+              [r1ap0] "r"(&blk1->qs[0]), [r1ap1] "r"(&blk1->qs[8]), [r1ap2] "r"(&blk1->qs[16]), [r1ap3] "r"(&blk1->qs[24]),
+              [bv0] "m"(*(const float (*)[8]) & b_ptr[0]), [bv1] "m"(*(const float (*)[8]) & b_ptr[8]),
+              [bv2] "m"(*(const float (*)[8]) & b_ptr[16]), [bv3] "m"(*(const float (*)[8]) & b_ptr[24])
+            : "f10", "f11", "f12", "f13", "f14", "f15", "f16", "f17");
+
+        // f20 += f10 * broadcast(scale0); f21 += f11 * broadcast(scale1)
+        uint32_t scale_raw0 = (uint32_t) blk0->d;
+        uint32_t scale_raw1 = (uint32_t) blk1->d;
+        __asm__ volatile(
+            "fbcx.ps f18, %[s0]\n"
+            "fbcx.ps f19, %[s1]\n"
+            "fcvt.ps.f16 f18, f18\n"
+            "fcvt.ps.f16 f19, f19\n"
+            "fmadd.ps f20, f10, f18, f20\n"
+            "fmadd.ps f21, f11, f19, f21\n"
+            :
+            : [s0] "r"(scale_raw0), [s1] "r"(scale_raw1)
+            : "f18", "f19", "f20", "f21");
+    }
+    float s0, s1;
+    __asm__ volatile(
+        "fswizz.ps f1, f20, 0xB1 \n\t"
+        "fadd.ps   f2, f20, f1, rne \n\t"
+        "fswizz.ps f3, f2, 0x4E \n\t"
+        "fadd.ps   f4, f2, f3, rne \n\t"
+        "fmvz.x.ps t0, f4, 4 \n\t"
+        "fbcx.ps   f5, t0 \n\t"
+        "fadd.ps   %[v0], f4, f5, rne \n\t"
+        "fswizz.ps f1, f21, 0xB1 \n\t"
+        "fadd.ps   f2, f21, f1, rne \n\t"
+        "fswizz.ps f3, f2, 0x4E \n\t"
+        "fadd.ps   f4, f2, f3, rne \n\t"
+        "fmvz.x.ps t0, f4, 4 \n\t"
+        "fbcx.ps   f5, t0 \n\t"
+        "fadd.ps   %[v1], f4, f5, rne \n\t"
+        : [v0] "=f"(s0), [v1] "=f"(s1)
+        :
+        : "t0", "f1", "f2", "f3", "f4", "f5", "f20", "f21");
+    *out0 = s0;
+    *out1 = s1;
+}
 
 // Compute dot product between f16 block and f32 column vector (NAIVE VERSION)
 // Scalar implementation for debugging - no vectorization
@@ -194,43 +432,11 @@ static inline float compute_block_dot_product_f32_partial(const float* a_block, 
     return final_sum;
 }
 
-
-
-
-
-
-
 // Compute dot product between f32 block and f32 column vector
 // Vectorized: processes 8 elements at a time using ET vector instructions
 // Block size: 16 f32 values (64 bytes = 1 cache line)
 static inline float compute_block_dot_product_f32(const float* a_block, const float* b_col_start) {
     return compute_block_dot_product_f32_partial(a_block, b_col_start, QK_F32);
-
-    // float acc_vec[8];
-    // unsigned long old_mask;
-    // __asm__ volatile(
-    //     // Save current mask
-    //     "mova.x.m %[old_mask]\n"
-    //     // Enable all 8 lanes
-    //     "mov.m.x m0, x0, 0xFF\n"
-
-    //     "flw.ps  f11, %[a]\n"
-    //     "flw.ps  f12, %[b]\n"
-    //     "fmadd.ps f10, f11, f12, f10\n"
-    //     "fsw.ps  f10, %[out]\n"
-    //     "mova.m.x %[old_mask]\n"
-
-    //     : [out] "=m" (*(float(*)[8])acc_vec),
-    //       [old_mask] "=r"(old_mask)
-    //     : [a] "m" (*(const float(*)[8])a_block),
-    //       [b] "m" (*(const float(*)[8])b_col_start)
-    //     : "f10", "f11", "f12"
-    // );
-
-    // // Horizontal reduction
-    // return acc_vec[0] + acc_vec[1] + acc_vec[2] + acc_vec[3] +
-    //        acc_vec[4] + acc_vec[5] + acc_vec[6] + acc_vec[7];
-
 }
 
 #endif // BLOCK_OPS_H
