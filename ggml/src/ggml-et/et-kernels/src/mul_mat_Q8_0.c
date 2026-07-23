@@ -10,52 +10,113 @@
 #include "quants.h"
 #include "block_ops.h"
 
-// Using the block prefetch logic
-static inline void prefetch_weight_row(const void* start_ptr, int64_t num_blocks, uint32_t worker_id) {
-    const uint64_t cache_line_size = 64;
-    uintptr_t self_ptr = (uintptr_t)start_ptr;
-    uintptr_t self_ptr_end = self_ptr + (num_blocks * sizeof(block_q8_0));
+// Row dot product with vectorized fp16 block-scale unpack.
+//
+// compute_block_dot_product_q8_0_masked() converts each block's fp16 delta to
+// f32 with fp16_to_fp32() -- a scalar, branch-laden bit-twiddle (exponent
+// zero/subnormal/inf/nan cases, a data-dependent normalize loop for
+// subnormals). Q8_0 block deltas are always *normal* fp16 (d = max|q|/127,
+// computed at quantization time), so none of those branches ever actually
+// fire for this field -- the hardware vector fp16->f32 convert (fcvt.ps.f16,
+// already used elsewhere in this file for f16 activation dots) is bit-exact
+// for normal inputs and can replace it.
+//
+// block_q8_0 is 34 bytes (2-byte delta + 32 int8 quants), so 8 consecutive
+// block deltas are NOT contiguous in memory -- pack them into a contiguous
+// scratch buffer first (8 plain halfword loads/stores, no branch), then do
+// ONE vector gather+convert for the group instead of 8 separate scalar
+// converts. Falls back to fp16_to_fp32() for the K_blocks % 8 tail.
+//
+// Note: this function only changes how ONE hart computes its OWN row -- it
+// has no cross-hart interaction and does not touch M/hart striping at all.
+// (A separate cache-line-owned-store restructuring of the OUTER hart
+// striping was tried and reverted after a real board run showed it collapses
+// hardware parallelism from 2048-way to 128-way for this model's M=2048 --
+// see corpus entry hackathon_llama32_1b_LEVER2_CACHELINE_STORES_PARALLELISM_BUG_20260723.
+// This function is independent of that and keeps the original, full-parallelism
+// per-element hart striping.)
+static inline float compute_row_dot_product_q8_0_scaleunpack(
+    const block_q8_0* q_row, const float* b_col_base, int64_t K_blocks) {
+    static const int32_t gather_bytes[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+    static const int32_t f16_pattern[8]  = {0, 2, 4, 6, 8, 10, 12, 14};
 
-    // 1. Align to cache lines and calculate range
-    uint64_t startCL = (self_ptr + 63) >> 6;
-    uint64_t endCL = (self_ptr_end + 63) >> 6;
-    if (endCL >= startCL) {
-        uint64_t total_lines = endCL - startCL + 1;
-        // 2. Load balance across the minions in the Shire (assuming 8 per group for this logic)
-        // Adjust worker_id if using global_id
-        uint32_t local_worker_id = worker_id % 8;
-        uint64_t lines_per_minion = total_lines >> 3;
-        uint64_t extra = total_lines & 7;
+    unsigned long saved_mask;
+    __asm__ volatile("mova.x.m %0" : "=r"(saved_mask));
+    __asm__ volatile("mov.m.x m0, x0, 0xFF");
 
-        uint64_t offset = local_worker_id * lines_per_minion;
-        if (local_worker_id < extra) {
-            offset += local_worker_id;
-            lines_per_minion++;
-        } else {
-            offset += extra;
+    float row_sum = 0.0f;
+    const int64_t groups = K_blocks / 8;
+    const int64_t tail_start = groups * 8;
+
+    for (int64_t g = 0; g < groups; g++) {
+        // Pack 8 block deltas into a contiguous scratch buffer (plain
+        // halfword copies, no branch), then convert all 8 to f32 in one
+        // vector instruction.
+        uint16_t deltas[8] __attribute__((aligned(16)));
+        for (int i = 0; i < 8; i++) {
+            deltas[i] = q_row[g * 8 + i].d;
         }
-        self_ptr = (startCL + offset) << 6;
-        int pending_lines = lines_per_minion;
+        float scales[8] __attribute__((aligned(32)));
+        __asm__ volatile(
+            "flw.ps    f21, %[pat]\n"
+            "fgh.ps    f20, f21(%[d])\n"
+            "fcvt.ps.f16 f20, f20\n"
+            "fsw.ps    f20, %[out]\n"
+            : [out] "=m"(*(float(*)[8])scales)
+            : [d] "r"(deltas),
+              [pat] "m"(*(const int32_t(*)[8])f16_pattern)
+            : "f20", "f21"
+        );
 
-        // 3. Hardware Prefetch Loop (16 lines at a time)
-        for (; pending_lines > 0; pending_lines -= 16) {
-            uint64_t current_batch = (pending_lines > 16 ? 16 : pending_lines) - 1;
-            uint64_t self_size = current_batch; // bits 3:0
+        for (int i = 0; i < 8; i++) {
+            const block_q8_0* blk = q_row + g * 8 + i;
+            const float* b = b_col_base + ((int64_t)(g * 8 + i) << 5);
 
-            __asm__ __volatile__ (
-                "li    x1, 0x400000000000000 \n"  // Dest = L2 (bits 59:58 = 01)
-                "addi  x31, zero, 64\n"  // Stride = 64 bytes
-                "or    x3, x1, %[ptr]\n"  // Combine Dest + VA
-                "or    x3, x3, %[sz]\n"  // Combine with NumLines
-                "csrw  0x81f, x3\n"  // prefetch_va
-                :
-                : [ptr] "r" (self_ptr),
-                  [sz] "r" (self_size)
-                : "x1", "x3", "x31", "memory"
+            float acc;
+            __asm__ volatile(
+                "flw.ps   f31, %[gb]\n"
+                "fbci.pi  f10, 0\n"
+                "flw.ps   f12, 0(%[b])\n"
+                "fgb.ps   f11, f31(%[a])\n"
+                "fcvt.ps.pw f11, f11\n"
+                "fmadd.ps f10, f11, f12, f10\n"
+                "flw.ps   f12, 32(%[b])\n"
+                "fgb.ps   f11, f31(%[a1])\n"
+                "fcvt.ps.pw f11, f11\n"
+                "fmadd.ps f10, f11, f12, f10\n"
+                "flw.ps   f12, 64(%[b])\n"
+                "fgb.ps   f11, f31(%[a2])\n"
+                "fcvt.ps.pw f11, f11\n"
+                "fmadd.ps f10, f11, f12, f10\n"
+                "flw.ps   f12, 96(%[b])\n"
+                "fgb.ps   f11, f31(%[a3])\n"
+                "fcvt.ps.pw f11, f11\n"
+                "fmadd.ps f10, f11, f12, f10\n"
+                "fswizz.ps f1, f10, 0xB1\n"
+                "fadd.ps   f2, f10, f1, rne\n"
+                "fswizz.ps f3, f2, 0x4E\n"
+                "fadd.ps   f4, f2, f3, rne\n"
+                "fmvz.x.ps t0, f4, 4\n"
+                "fbcx.ps   f5, t0\n"
+                "fadd.ps   %[out], f4, f5, rne\n"
+                : [out] "=f"(acc)
+                : [gb] "m"(*(const int32_t(*)[8])gather_bytes),
+                  [a] "r"(blk->qs), [a1] "r"(blk->qs + 8),
+                  [a2] "r"(blk->qs + 16), [a3] "r"(blk->qs + 24),
+                  [b] "r"(b)
+                : "memory", "t0", "f1", "f2", "f3", "f4", "f5",
+                  "f10", "f11", "f12", "f31"
             );
-            self_ptr += (16 * 64);
+            row_sum += acc * scales[i];
         }
     }
+
+    for (int64_t kb = tail_start; kb < K_blocks; kb++) {
+        row_sum += compute_block_dot_product_q8_0_masked(q_row + kb, b_col_base + (kb << 5));
+    }
+
+    __asm__ volatile("mova.m.x %0" :: "r"(saved_mask));
+    return row_sum;
 }
 
 int entry_point(struct ggml_et_binary_params* params, void* env) {
@@ -103,35 +164,18 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
             const char* src1_ptr2 = src1_ptr3 + i2 * nb12;
             char* dst_ptr2       = dst_ptr3 + i2 * nbd2;
 
+            // Original per-element hart striping (preserves full 2048-way
+            // parallelism for this model's M -- do NOT restructure this to
+            // stripe over cache lines/tiles instead of individual m values;
+            // see corpus entry ..._PARALLELISM_BUG_20260723 for why that
+            // collapses parallelism 16x and cost a board run).
             for (int64_t n = 0; n < N; n++) {
-                // src1 is F32, so column pointer moves by nb11
                 const float* b_col_base = (const float*)(src1_ptr2 + n * nb11);
 
-                for (int64_t m = hart_id; m < M; m += stride_m) {
-                    // src0 is Q8_0 blocks, row pointer moves by nb01
+                for (int64_t m = (int64_t)hart_id; m < M; m += stride_m) {
                     const block_q8_0* q_row = (const block_q8_0*)(src0_ptr2 + m * nb01);
-                    float sum = 0.0f;
+                    float sum = compute_row_dot_product_q8_0_scaleunpack(q_row, b_col_base, K_blocks);
 
-                    // Set the vector mask ONCE for this row's whole K_blocks
-                    // loop instead of paying a save/set/restore CSR sequence
-                    // on every 32-element block call -- see
-                    // compute_block_dot_product_q8_0_masked in block_ops.h.
-                    // Mask CSR state is untouched by anything else between
-                    // these two asm blocks, so this is value-identical to
-                    // the per-call save/set/restore it replaces.
-                    unsigned long saved_mask;
-                    __asm__ volatile("mova.x.m %0" : "=r"(saved_mask));
-                    __asm__ volatile("mov.m.x m0, x0, 0xFF");
-
-                    for (int64_t kb = 0; kb < K_blocks; kb++) {
-                        // q_row is a pointer to blocks, so + kb moves by sizeof(block_q8_0)
-                        // b_col is float*, so we move 32 elements (kb << 5)
-                        sum += compute_block_dot_product_q8_0_masked(q_row + kb, b_col_base + (kb << 5));
-                    }
-
-                    __asm__ volatile("mova.m.x %0" :: "r"(saved_mask));
-
-                    // Store result in dst[m, n, i2, i3]
                     float* dst_entry = (float*)(dst_ptr2 + n * nbd1 + m * sizeof(float));
                     atomic_store_f32((volatile float*)dst_entry, sum);
                 }
