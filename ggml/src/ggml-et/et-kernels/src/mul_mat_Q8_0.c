@@ -10,54 +10,6 @@
 #include "quants.h"
 #include "block_ops.h"
 
-// Using the block prefetch logic
-static inline void prefetch_weight_row(const void* start_ptr, int64_t num_blocks, uint32_t worker_id) {
-    const uint64_t cache_line_size = 64;
-    uintptr_t self_ptr = (uintptr_t)start_ptr;
-    uintptr_t self_ptr_end = self_ptr + (num_blocks * sizeof(block_q8_0));
-
-    // 1. Align to cache lines and calculate range
-    uint64_t startCL = (self_ptr + 63) >> 6;
-    uint64_t endCL = (self_ptr_end + 63) >> 6;
-    if (endCL >= startCL) {
-        uint64_t total_lines = endCL - startCL + 1;
-        // 2. Load balance across the minions in the Shire (assuming 8 per group for this logic)
-        // Adjust worker_id if using global_id
-        uint32_t local_worker_id = worker_id % 8;
-        uint64_t lines_per_minion = total_lines >> 3;
-        uint64_t extra = total_lines & 7;
-
-        uint64_t offset = local_worker_id * lines_per_minion;
-        if (local_worker_id < extra) {
-            offset += local_worker_id;
-            lines_per_minion++;
-        } else {
-            offset += extra;
-        }
-        self_ptr = (startCL + offset) << 6;
-        int pending_lines = lines_per_minion;
-
-        // 3. Hardware Prefetch Loop (16 lines at a time)
-        for (; pending_lines > 0; pending_lines -= 16) {
-            uint64_t current_batch = (pending_lines > 16 ? 16 : pending_lines) - 1;
-            uint64_t self_size = current_batch; // bits 3:0
-
-            __asm__ __volatile__ (
-                "li    x1, 0x400000000000000 \n"  // Dest = L2 (bits 59:58 = 01)
-                "addi  x31, zero, 64\n"  // Stride = 64 bytes
-                "or    x3, x1, %[ptr]\n"  // Combine Dest + VA
-                "or    x3, x3, %[sz]\n"  // Combine with NumLines
-                "csrw  0x81f, x3\n"  // prefetch_va
-                :
-                : [ptr] "r" (self_ptr),
-                  [sz] "r" (self_size)
-                : "x1", "x3", "x31", "memory"
-            );
-            self_ptr += (16 * 64);
-        }
-    }
-}
-
 int entry_point(struct ggml_et_binary_params* params, void* env) {
     uint64_t hart_id = get_hart_id();
     const int64_t stride_m = 2048;
@@ -103,37 +55,86 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
             const char* src1_ptr2 = src1_ptr3 + i2 * nb12;
             char* dst_ptr2       = dst_ptr3 + i2 * nbd2;
 
-            for (int64_t n = 0; n < N; n++) {
-                // src1 is F32, so column pointer moves by nb11
-                const float* b_col_base = (const float*)(src1_ptr2 + n * nb11);
+            // Cache-line-owned output stores.
+            //
+            // atomic_store_f32 uses a global read-modify-write for every single
+            // output element. That atomic is only needed because dst is
+            // m-contiguous and the default striping (m = hart_id, hart_id +
+            // stride_m, ...) scatters 16 adjacent m's -- one 64B/16-float cache
+            // line, on this non-coherent-L1D target -- across 16 DIFFERENT
+            // harts, so without an atomic two harts could race the same line.
+            //
+            // When M is a multiple of 16 and dst is 64B-aligned (true for every
+            // Q8_0 weight matmul in this model family: hidden_size, ffn
+            // intermediate_size, and vocab_size are all multiples of 16), we can
+            // instead give each hart a WHOLE 64B output line (16 consecutive m,
+            // for one n) to itself. Nothing else ever touches that hart's line,
+            // so it can use a plain store -- no amoswapg.w, no global-bypass
+            // cost. Falls back to the exact original per-element atomic path
+            // whenever the alignment doesn't hold; correctness never depends on
+            // which branch runs.
+            const int64_t M_lines = M >> 4;  // 16 f32 = 64B cache line
+            const bool aligned =
+                (M >= 16) && ((M & 15) == 0) &&
+                (((uintptr_t)dst_ptr2 & 63) == 0) && ((nbd1 & 63) == 0);
 
-                for (int64_t m = hart_id; m < M; m += stride_m) {
-                    // src0 is Q8_0 blocks, row pointer moves by nb01
-                    const block_q8_0* q_row = (const block_q8_0*)(src0_ptr2 + m * nb01);
-                    float sum = 0.0f;
+            if (aligned) {
+                for (int64_t n = 0; n < N; n++) {
+                    // src1 is F32, so column pointer moves by nb11
+                    const float* b_col_base = (const float*)(src1_ptr2 + n * nb11);
+                    float* dst_col = (float*)(dst_ptr2 + n * nbd1);
 
-                    // Set the vector mask ONCE for this row's whole K_blocks
-                    // loop instead of paying a save/set/restore CSR sequence
-                    // on every 32-element block call -- see
-                    // compute_block_dot_product_q8_0_masked in block_ops.h.
-                    // Mask CSR state is untouched by anything else between
-                    // these two asm blocks, so this is value-identical to
-                    // the per-call save/set/restore it replaces.
-                    unsigned long saved_mask;
-                    __asm__ volatile("mova.x.m %0" : "=r"(saved_mask));
-                    __asm__ volatile("mov.m.x m0, x0, 0xFF");
+                    for (int64_t line = (int64_t)hart_id; line < M_lines; line += stride_m) {
+                        const int64_t m0 = line << 4;  // first m in this line
 
-                    for (int64_t kb = 0; kb < K_blocks; kb++) {
-                        // q_row is a pointer to blocks, so + kb moves by sizeof(block_q8_0)
-                        // b_col is float*, so we move 32 elements (kb << 5)
-                        sum += compute_block_dot_product_q8_0_masked(q_row + kb, b_col_base + (kb << 5));
+                        // Set the vector mask ONCE for this whole 16-row line
+                        // instead of paying a save/set/restore CSR sequence per
+                        // 32-element block call -- see
+                        // compute_block_dot_product_q8_0_masked in block_ops.h.
+                        unsigned long saved_mask;
+                        __asm__ volatile("mova.x.m %0" : "=r"(saved_mask));
+                        __asm__ volatile("mov.m.x m0, x0, 0xFF");
+
+                        for (int j = 0; j < 16; j++) {
+                            // src0 is Q8_0 blocks, row pointer moves by nb01
+                            const block_q8_0* q_row =
+                                (const block_q8_0*)(src0_ptr2 + (m0 + j) * nb01);
+                            float sum = 0.0f;
+                            for (int64_t kb = 0; kb < K_blocks; kb++) {
+                                sum += compute_block_dot_product_q8_0_masked(
+                                    q_row + kb, b_col_base + (kb << 5));
+                            }
+                            // This hart owns the whole 64B line exclusively --
+                            // plain store, no atomic needed.
+                            dst_col[m0 + j] = sum;
+                        }
+
+                        __asm__ volatile("mova.m.x %0" :: "r"(saved_mask));
                     }
+                }
+            } else {
+                // Unaligned fallback: original per-element striped/atomic path.
+                for (int64_t n = 0; n < N; n++) {
+                    const float* b_col_base = (const float*)(src1_ptr2 + n * nb11);
 
-                    __asm__ volatile("mova.m.x %0" :: "r"(saved_mask));
+                    for (int64_t m = (int64_t)hart_id; m < M; m += stride_m) {
+                        const block_q8_0* q_row = (const block_q8_0*)(src0_ptr2 + m * nb01);
+                        float sum = 0.0f;
 
-                    // Store result in dst[m, n, i2, i3]
-                    float* dst_entry = (float*)(dst_ptr2 + n * nbd1 + m * sizeof(float));
-                    atomic_store_f32((volatile float*)dst_entry, sum);
+                        unsigned long saved_mask;
+                        __asm__ volatile("mova.x.m %0" : "=r"(saved_mask));
+                        __asm__ volatile("mov.m.x m0, x0, 0xFF");
+
+                        for (int64_t kb = 0; kb < K_blocks; kb++) {
+                            sum += compute_block_dot_product_q8_0_masked(
+                                q_row + kb, b_col_base + (kb << 5));
+                        }
+
+                        __asm__ volatile("mova.m.x %0" :: "r"(saved_mask));
+
+                        float* dst_entry = (float*)(dst_ptr2 + n * nbd1 + m * sizeof(float));
+                        atomic_store_f32((volatile float*)dst_entry, sum);
+                    }
                 }
             }
         }
