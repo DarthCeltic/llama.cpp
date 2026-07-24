@@ -317,7 +317,21 @@ bool ggml_et_op_mul_mat(ggml_backend_et_device_context* dev_ctx, const ggml_tens
 
     if (node->type == GGML_TYPE_F32 && node->src[0]->type == GGML_TYPE_Q8_0 &&
         node->src[1]->type == GGML_TYPE_F32 &&
-        node->src[1]->ne[1] >= 47 &&      // N >= 47
+        node->src[1]->ne[1] >= 1 &&      // N >= 1 (was 47) -- Combo G: route decode's N=1
+                                          // GEMV through the tensor engine too. The kernel
+                                          // (mul_mat_Q8_0_matrix_engine.c) already has real
+                                          // n_cur<TILE_N edge-case handling down to a single
+                                          // row (its bias-preload path checks n_cur>0..>4
+                                          // individually) -- the >=47 floor was a dispatch
+                                          // heuristic, not a kernel correctness requirement.
+                                          // Oracle-confirmed correct at n=1..9, m=16, k=256
+                                          // (previously these always routed to the scalar
+                                          // kernel; now to the tensor engine). Whether this
+                                          // is actually FASTER for a single N=1 dispatch is
+                                          // an open, real question this session cannot answer
+                                          // locally -- sys-emu is not a performance oracle
+                                          // (see docs/opinionated_porting_options/martin.md
+                                          // section 7) -- only real board data can.
         node->src[0]->ne[1] % 16 == 0 &&  // M % TILE_M
         node->src[0]->ne[0] % 32 == 0) {  // K % BLOCK_K (Q8_0 block)
 
