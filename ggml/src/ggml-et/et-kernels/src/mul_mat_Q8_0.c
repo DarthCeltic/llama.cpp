@@ -2,45 +2,31 @@
 // MUL_MAT Kernel
 // Matrix multiplication: C[M,N] = A[M,K] * B[K,N]
 //
-// COMBO A -- structural base, unmodified.
+// COMBO E -- x2-row B-load reuse (Rehan's win) COMBINED with batched-8
+// fp16 scale-convert (this session's own lever), via a different
+// composition than Combo C's trade-off.
 //
-// Kernel body is RehanQasim-dev's Q8_0 matrix-engine GEMM design
-// (aifoundry-org/llama.cpp commit 84405bb7f86458c60c9f47a6a140f1c876da8532,
-// "et-backend: Q8_0 matrix-engine GEMM kernel for prefill"), rebuilt here
-// against the CURRENT shared main tip (f67c2b2a30a24bf9354857cde0f233620a20eb23)
-// -- his own commit had diverged from current main's block_ops.h/mul_mat_Q8_0.c,
-// so this is a from-source graft (his q8_dot_* API merged into current main's
-// block_ops.h), not a blind file copy. Used under Ryan Gurganious/DarthCeltic's
-// explicit account-owner authorization from RehanQasim-dev to build on his code
-// for this track (see corpus entry
-// hackathon_llama32_1b_ABI_COMPAT_and_THREE_COMBO_PLAN_20260723).
+// Combo C traded away x2-row-batching to get batched-8 scale-convert
+// because Rehan's design defers the horizontal reduction to once-per-row
+// (persistent f20/f21 vector accumulators across all blocks), which needs
+// an arbitrary-lane (0..7) vector-to-scalar extract to apply a batch of 8
+// DIFFERENT per-block scales to that deferred accumulator -- no verified
+// ISA primitive for that exists in this codebase (only a FIXED lane-4
+// extract, used after a pairwise reduction, is ever seen).
 //
-// This PR (#168) is the empirical control: does this structure alone, freshly
-// rebuilt, reproduce his ~14.7 tok/s? PR#169/#170 layer independently-built,
-// additive levers (light prefetch, batched scale-convert) on top of this same
-// base, so real board data -- not prediction -- shows what each addition is
-// actually worth.
-//
-// EXCLUDED ON PURPOSE: Rehan's K-split / K-split-group branches (both-harts-
-// share-a-row via an L2SCP exchange + semaphore barrier) called
-// et_sem_post/et_sem_wait, et_shire_l2scp_local, and a whole-tensor
-// evict_region_past_l2 helper -- NONE of these exist anywhere in current
-// shared main's platform.h (grepped the full et-kernels/src tree at
-// f67c2b2a30a24bf9354857cde0f233620a20eb23, confirmed absent). His fork added
-// that semaphore infrastructure itself; it never landed on the shared tip.
-// Hand-guessing a semaphore/barrier implementation with no reference to
-// verify against is not a risk worth taking on real hardware (silent
-// wrong-answer or hang). Checked the actual shape math for llama32_1b
-// (hidden=2048, intermediate=8192, vocab=128256): every Q8_0 matmul's
-// K_blocks is <=256 (TILE_KB), so the tile-outer and K-split-group branches
-// are dead code for this model's shapes anyway -- except the K-split "small
-// rows" carve-out, which specifically would help k_proj/v_proj at M=512
-// (1536 of 2048 harts otherwise idle under plain striping). That specific
-// gap is real and left as an open, flagged opportunity for anyone who can
-// source the real semaphore primitives -- not silently dropped. Tile-outer
-// is kept (uses only confirmed-available primitives) for robustness against
-// the OTHER 11 regression-check models, which may have larger K than this
-// track's target model.
+// This combo sidesteps that blocker entirely: instead of extracting from
+// an ISA vector register, the batched-8 scale-convert already writes its
+// result to a PLAIN C FLOAT ARRAY in memory (scales[8], via fsw.ps) -- a
+// completely ordinary compiler-visible float array, not a vector lane.
+// Reading scales[i] is then just a normal C array index, no ISA extract
+// needed at all. This means batched-8 scale-convert composes cleanly with
+// x2-row B-reuse PROVIDED the horizontal reduction happens per-block
+// (immediately, for each row) rather than being deferred to end-of-row --
+// i.e. this combo pays Rehan's "reduce once at the end" efficiency to gain
+// the batched scale-convert efficiency, the mirror-image trade of Combo C
+// (which paid away x2's B-reuse to gain the same thing). Whether this
+// nets out positive, given each has different real costs, is exactly the
+// kind of question real board data (not prediction) should answer.
 //
 // Verified via llama.cpp's own test-backend-ops oracle against the real ET
 // software-emulator backend before submission.
@@ -57,6 +43,130 @@
 #define STRIDE_M       2048 /* 32 shires x 32 minions x 2 harts */
 #define TILE_KB        256  /* K-tile size in Q8_0 blocks (8192 elems, 32KB B data) */
 #define SIMPLE_X2_ROWS 2
+
+// Compute two rows' raw (UNSCALED) dot products for one Q8_0 block, reusing
+// the same loaded B-values across both rows (Rehan's x2 win). Returns the
+// two 8-wide partial sums horizontally reduced to scalars immediately (not
+// deferred) so a plain C float scale can be applied by the caller.
+static inline void q8_dot_block_x2_raw(const block_q8_0 * blk0, const block_q8_0 * blk1, const float * b_ptr,
+                                       float * out0, float * out1) {
+    __asm__ volatile(
+        "fbci.pi     f10, 0\n"
+        "fbci.pi     f11, 0\n"
+
+        "flw.ps      f12, %[bv0]\n"
+        "fgb.ps      f16, f31(%[r0ap0])\n"
+        "fcvt.ps.pw  f16, f16\n"
+        "fmadd.ps    f10, f16, f12, f10\n"
+        "fgb.ps      f17, f31(%[r1ap0])\n"
+        "fcvt.ps.pw  f17, f17\n"
+        "fmadd.ps    f11, f17, f12, f11\n"
+
+        "flw.ps      f13, %[bv1]\n"
+        "fgb.ps      f16, f31(%[r0ap1])\n"
+        "fcvt.ps.pw  f16, f16\n"
+        "fmadd.ps    f10, f16, f13, f10\n"
+        "fgb.ps      f17, f31(%[r1ap1])\n"
+        "fcvt.ps.pw  f17, f17\n"
+        "fmadd.ps    f11, f17, f13, f11\n"
+
+        "flw.ps      f14, %[bv2]\n"
+        "fgb.ps      f16, f31(%[r0ap2])\n"
+        "fcvt.ps.pw  f16, f16\n"
+        "fmadd.ps    f10, f16, f14, f10\n"
+        "fgb.ps      f17, f31(%[r1ap2])\n"
+        "fcvt.ps.pw  f17, f17\n"
+        "fmadd.ps    f11, f17, f14, f11\n"
+
+        "flw.ps      f15, %[bv3]\n"
+        "fgb.ps      f16, f31(%[r0ap3])\n"
+        "fcvt.ps.pw  f16, f16\n"
+        "fmadd.ps    f10, f16, f15, f10\n"
+        "fgb.ps      f17, f31(%[r1ap3])\n"
+        "fcvt.ps.pw  f17, f17\n"
+        "fmadd.ps    f11, f17, f15, f11\n"
+
+        "fswizz.ps   f1, f10, 0xB1\n"
+        "fadd.ps     f2, f10, f1, rne\n"
+        "fswizz.ps   f3, f2, 0x4E\n"
+        "fadd.ps     f4, f2, f3, rne\n"
+        "fmvz.x.ps   t0, f4, 4\n"
+        "fbcx.ps     f5, t0\n"
+        "fadd.ps     %[o0], f4, f5, rne\n"
+
+        "fswizz.ps   f1, f11, 0xB1\n"
+        "fadd.ps     f2, f11, f1, rne\n"
+        "fswizz.ps   f3, f2, 0x4E\n"
+        "fadd.ps     f4, f2, f3, rne\n"
+        "fmvz.x.ps   t0, f4, 4\n"
+        "fbcx.ps     f5, t0\n"
+        "fadd.ps     %[o1], f4, f5, rne\n"
+        : [o0] "=f"(*out0), [o1] "=f"(*out1)
+        : [r0ap0] "r"(&blk0->qs[0]), [r0ap1] "r"(&blk0->qs[8]), [r0ap2] "r"(&blk0->qs[16]), [r0ap3] "r"(&blk0->qs[24]),
+          [r1ap0] "r"(&blk1->qs[0]), [r1ap1] "r"(&blk1->qs[8]), [r1ap2] "r"(&blk1->qs[16]), [r1ap3] "r"(&blk1->qs[24]),
+          [bv0] "m"(*(const float (*)[8]) & b_ptr[0]), [bv1] "m"(*(const float (*)[8]) & b_ptr[8]),
+          [bv2] "m"(*(const float (*)[8]) & b_ptr[16]), [bv3] "m"(*(const float (*)[8]) & b_ptr[24])
+        : "t0", "f1", "f2", "f3", "f4", "f5", "f10", "f11", "f12", "f13", "f14", "f15", "f16", "f17");
+}
+
+// x2-row dot with batched-8 scale-convert. Mask assumed already 0xFF
+// (caller wraps with q8_dot_begin/end).
+static inline void q8_dot_compute_x2_scaleunpack(const block_q8_0 * q_row0, const block_q8_0 * q_row1,
+                                                  const float * b_col_base, int64_t K_blocks, float * out0,
+                                                  float * out1) {
+    static const int32_t gather_bytes[8] = { 0, 1, 2, 3, 4, 5, 6, 7 };
+    static const int32_t f16_pattern[8]  = { 0, 2, 4, 6, 8, 10, 12, 14 };
+
+    __asm__ volatile("flw.ps f31, %[g]\n" : : [g] "m"(*(const int32_t (*)[8]) gather_bytes) : "f31");
+
+    float         row_sum0   = 0.0f;
+    float         row_sum1   = 0.0f;
+    const int64_t groups     = K_blocks / 8;
+    const int64_t tail_start = groups * 8;
+
+    for (int64_t g = 0; g < groups; g++) {
+        // Batch-convert 8 blocks' deltas for row0 and row1 into plain C
+        // float arrays -- ordinary memory, no ISA lane extract needed.
+        uint16_t deltas0[8] __attribute__((aligned(16)));
+        uint16_t deltas1[8] __attribute__((aligned(16)));
+        for (int i = 0; i < 8; i++) {
+            deltas0[i] = q_row0[g * 8 + i].d;
+            deltas1[i] = q_row1[g * 8 + i].d;
+        }
+        float scales0[8] __attribute__((aligned(32)));
+        float scales1[8] __attribute__((aligned(32)));
+        __asm__ volatile(
+            "flw.ps      f21, %[pat]\n"
+            "fgh.ps      f20, f21(%[d0])\n"
+            "fcvt.ps.f16 f20, f20\n"
+            "fsw.ps      f20, %[out0]\n"
+            "fgh.ps      f20, f21(%[d1])\n"
+            "fcvt.ps.f16 f20, f20\n"
+            "fsw.ps      f20, %[out1]\n"
+            : [out0] "=m"(*(float (*)[8]) scales0), [out1] "=m"(*(float (*)[8]) scales1)
+            : [d0] "r"(deltas0), [d1] "r"(deltas1), [pat] "m"(*(const int32_t (*)[8]) f16_pattern)
+            : "f20", "f21");
+
+        for (int i = 0; i < 8; i++) {
+            const block_q8_0 * blk0  = q_row0 + g * 8 + i;
+            const block_q8_0 * blk1  = q_row1 + g * 8 + i;
+            const float *      b_ptr = b_col_base + ((int64_t) (g * 8 + i) << 5);
+
+            float raw0, raw1;
+            q8_dot_block_x2_raw(blk0, blk1, b_ptr, &raw0, &raw1);
+            row_sum0 += raw0 * scales0[i];
+            row_sum1 += raw1 * scales1[i];
+        }
+    }
+
+    for (int64_t kb = tail_start; kb < K_blocks; kb++) {
+        row_sum0 += compute_row_dot_q8_0(q_row0 + kb, b_col_base + (kb << 5), 1);
+        row_sum1 += compute_row_dot_q8_0(q_row1 + kb, b_col_base + (kb << 5), 1);
+    }
+
+    *out0 = row_sum0;
+    *out1 = row_sum1;
+}
 
 int entry_point(struct ggml_et_mm_q8_params * params, void * env) {
     uint64_t hart_id = get_hart_id();
@@ -98,13 +208,8 @@ int entry_point(struct ggml_et_mm_q8_params * params, void * env) {
     const int64_t r3 = ne13 / ne03;
 
     if (K_blocks > TILE_KB) {
-        /*
-         * Tile-outer with scalar row groups: process up to 4 rows per
-         * hart sharing each B tile before advancing to the next tile.
-         * Uses scalar float variables (not an array) to accumulate across
-         * tiles - avoids the flw/fadd.s/fsw stack ops that corrupt vector
-         * register state on ET-SoC-1's MMX-style shared FP file.
-         */
+        /* Tile-outer path (large K, e.g. other regression models) --
+         * unchanged, uses only confirmed-available primitives. */
         for (int64_t i3 = 0; i3 < ne13; i3++) {
             const int64_t i03       = i3 / r3;
             const char *  src0_ptr3 = (const char *) params->src0.data + i03 * nb03;
@@ -174,11 +279,10 @@ int entry_point(struct ggml_et_mm_q8_params * params, void * env) {
         }
     } else {
         /*
-         * Simple path for small K.
-         *
-         * When `nb01` is 32-byte aligned, every row has the same block-alignment
-         * pattern. That lets us compute two rows together and reuse each loaded
-         * B chunk across both rows instead of reloading it in a second dot call.
+         * Simple path: x2-row B-reuse when nb01 is 32-byte aligned, WITH
+         * batched-8 scale-convert (see file header). Falls back to a
+         * single-row batched-8 path for the odd leftover row / non-aligned
+         * case.
          */
         for (int64_t i3 = 0; i3 < ne13; i3++) {
             const int64_t i03       = i3 / r3;
@@ -208,7 +312,7 @@ int entry_point(struct ggml_et_mm_q8_params * params, void * env) {
                             if (m1 < M) {
                                 const block_q8_0 * q_row1 = (const block_q8_0 *) (src0_ptr2 + m1 * nb01);
                                 float              s0, s1;
-                                q8_dot_compute_x2_aligned(q_row0, q_row1, b_col_base, K_blocks, &s0, &s1);
+                                q8_dot_compute_x2_scaleunpack(q_row0, q_row1, b_col_base, K_blocks, &s0, &s1);
 
                                 float * dst0 = (float *) (dst_ptr2 + n * nbd1 + m0 * sizeof(float));
                                 float * dst1 = (float *) (dst_ptr2 + n * nbd1 + m1 * sizeof(float));
